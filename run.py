@@ -327,7 +327,11 @@ def build_optimizer_and_scheduler(
     lr_graph: float,
     weight_decay: float,
     graph_train_mode: str,
-    logit_scale_lr_mult: float = 10.0,
+    lr_disease_encoder: float = 1e-4,
+    logit_scale_lr_mult: float = 1.0,
+    scheduler_t0: int = 20,
+    scheduler_t_mult: int = 2,
+    scheduler_eta_min: float = 1e-6,
 ) -> tuple[torch.optim.Optimizer, object]:
     graph_params = list(model.graph_encoder.parameters())
     graph_param_ids = {id(p) for p in graph_params}
@@ -355,9 +359,8 @@ def build_optimizer_and_scheduler(
         graph_lr = lr_graph
     else:
         raise ValueError(f"Unknown graph_train_mode: {graph_train_mode}")
-    # DiseaseEncoder always trains at graph LR (or lr*0.1 floor), even when
-    # graph encoder itself is frozen.
-    disease_enc_lr = min(lr_graph, lr * 0.1) if disease_enc_params else 0.0
+    # DiseaseEncoder has its own LR (no pretrained weights to protect).
+    disease_enc_lr = lr_disease_encoder if disease_enc_params else 0.0
 
     logit_scale_lr = lr * logit_scale_lr_mult
     param_groups = [
@@ -375,9 +378,9 @@ def build_optimizer_and_scheduler(
     optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=20,
-        T_mult=2,
-        eta_min=1e-6,
+        T_0=scheduler_t0,
+        T_mult=scheduler_t_mult,
+        eta_min=scheduler_eta_min,
     )
     return optimizer, scheduler
 
@@ -397,12 +400,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size-func", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--lr-graph", type=float, default=None)
+    p.add_argument("--lr-disease-encoder", type=float, default=None,
+                   help="DiseaseEncoder LR (default 1e-4; independent of lr_graph)")
     p.add_argument("--lr-graph-warmup", type=float, default=None,
                    help="Graph LR during warmup phase (e.g. 1e-3 to match main LR)")
     p.add_argument("--graph-warmup-epochs", type=int, default=None,
                    help="Epochs to use boosted graph LR before decaying to lr_graph")
+    p.add_argument("--graph-cache-refresh-steps", type=int, default=None,
+                   help="Trainable graph cache refresh interval in optimizer steps (1 = recompute every step)")
     p.add_argument("--weight-decay", type=float, default=None)
     p.add_argument("--grad-clip-norm", type=float, default=None)
+    p.add_argument("--eval-interval", type=int, default=None,
+                   help="Run full validation every N epochs (default 3, 1=every epoch)")
     p.add_argument("--early-stopping-patience", type=int, default=None)
     p.add_argument(
         "--task-mode",
@@ -519,7 +528,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vd-kl-d2v-random-negatives", type=int, default=None)
     p.add_argument("--vd-kl-d2v-max-positive-variants", type=int, default=None)
     p.add_argument("--vd-kl-adaptive-weight", type=int, choices=[0, 1], default=None)
-    p.add_argument("--vd-kl-adaptive-target-scale", type=float, default=None)
+    p.add_argument("--vd-kl-adaptive-reference-scale", type=float, default=None)
     p.add_argument("--vd-kl-concept-filter-level", type=int, choices=[0, 1, 2], default=0,
                     help="Teacher concept filter: 0=none, 1=remove PheCodes+exact disease names, 2=L1+fuzzy 70%%")
     p.add_argument("--vd-kl-shuffle-teacher", type=int, choices=[0, 1], default=0,
@@ -534,6 +543,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--disease-encoder-type", type=str, default=None,
                     choices=["hpo_attention", "disease_id"],
                     help="Disease encoder type: hpo_attention (default) or disease_id (learnable embedding)")
+    p.add_argument("--data-root", type=str, default=None,
+                    help="Override base data directory (replaces ../data/ prefix in all default paths)")
+    p.add_argument("--num-workers", type=int, default=None,
+                    help="DataLoader num_workers (default: 2 for GPU, 0 for CPU)")
+    p.add_argument("--hidden-dim", type=int, default=None,
+                    help="Model hidden dimension (default 256)")
+    p.add_argument("--out-dim", type=int, default=None,
+                    help="Model output / CLIP embedding dimension (default 128)")
+    p.add_argument("--scheduler-t0", type=int, default=None,
+                    help="CosineAnnealingWarmRestarts T_0 (default 20)")
+    p.add_argument("--scheduler-t-mult", type=int, default=None,
+                    help="CosineAnnealingWarmRestarts T_mult (default 2)")
+    p.add_argument("--scheduler-eta-min", type=float, default=None,
+                    help="CosineAnnealingWarmRestarts eta_min (default 1e-6)")
     return p.parse_args()
 
 
@@ -550,6 +573,16 @@ def _prepare_task_records_by_mode(
 def main() -> None:
     args = parse_args()
     cfg = default_config()
+    # --data-root: rewrite all ../data/ prefixed paths in PathsConfig
+    if args.data_root is not None:
+        data_root = args.data_root.rstrip("/")
+        old_prefix = "../data/"
+        for field_name in vars(cfg.paths):
+            val = getattr(cfg.paths, field_name)
+            if isinstance(val, str) and val.startswith(old_prefix):
+                setattr(cfg.paths, field_name, val.replace(old_prefix, data_root + "/", 1))
+    if args.num_workers is not None:
+        cfg.runtime.num_workers = args.num_workers
     split_only = False
     if args.epochs is not None:
         cfg.train.epochs = args.epochs
@@ -573,14 +606,20 @@ def main() -> None:
         cfg.train.lr = args.lr
     if args.lr_graph is not None:
         cfg.train.lr_graph = args.lr_graph
+    if args.lr_disease_encoder is not None:
+        cfg.train.lr_disease_encoder = args.lr_disease_encoder
     if args.lr_graph_warmup is not None:
         cfg.train.lr_graph_warmup = args.lr_graph_warmup
     if args.graph_warmup_epochs is not None:
         cfg.train.graph_warmup_epochs = args.graph_warmup_epochs
+    if args.graph_cache_refresh_steps is not None:
+        cfg.train.graph_cache_refresh_steps = args.graph_cache_refresh_steps
     if args.weight_decay is not None:
         cfg.train.weight_decay = args.weight_decay
     if args.grad_clip_norm is not None:
         cfg.train.grad_clip_norm = args.grad_clip_norm
+    if args.eval_interval is not None:
+        cfg.train.eval_interval = args.eval_interval
     if args.early_stopping_patience is not None:
         cfg.train.early_stopping_patience = args.early_stopping_patience
     if args.main_temperature is not None:
@@ -725,8 +764,8 @@ def main() -> None:
         cfg.train.vd_kl_d2v_max_positive_variants = args.vd_kl_d2v_max_positive_variants
     if args.vd_kl_adaptive_weight is not None:
         cfg.train.vd_kl_adaptive_weight = bool(args.vd_kl_adaptive_weight)
-    if args.vd_kl_adaptive_target_scale is not None:
-        cfg.train.vd_kl_adaptive_target_scale = args.vd_kl_adaptive_target_scale
+    if args.vd_kl_adaptive_reference_scale is not None:
+        cfg.train.vd_kl_adaptive_reference_scale = args.vd_kl_adaptive_reference_scale
     if args.loss_weight_main is not None:
         cfg.loss_weights.main = args.loss_weight_main
     if args.loss_weight_domain is not None:
@@ -735,6 +774,16 @@ def main() -> None:
         cfg.loss_weights.func = args.loss_weight_func
     if args.num_graph_layers is not None:
         cfg.model.num_graph_layers = args.num_graph_layers
+    if args.hidden_dim is not None:
+        cfg.model.hidden_dim = args.hidden_dim
+    if args.out_dim is not None:
+        cfg.model.out_dim = args.out_dim
+    if args.scheduler_t0 is not None:
+        cfg.train.scheduler_t0 = args.scheduler_t0
+    if args.scheduler_t_mult is not None:
+        cfg.train.scheduler_t_mult = args.scheduler_t_mult
+    if args.scheduler_eta_min is not None:
+        cfg.train.scheduler_eta_min = args.scheduler_eta_min
 
     disease_encoder_type = args.disease_encoder_type or "hpo_attention"
 
@@ -815,6 +864,8 @@ def main() -> None:
         raise ValueError("graph_warmup_epochs must be >= 0")
     if cfg.train.lr_graph_warmup < 0:
         raise ValueError("lr_graph_warmup must be >= 0")
+    if cfg.train.graph_cache_refresh_steps <= 0:
+        raise ValueError("graph_cache_refresh_steps must be > 0")
     if cfg.train.disease_freq_weight_agg not in {"max", "mean"}:
         raise ValueError(f"Unknown disease_freq_weight_agg: {cfg.train.disease_freq_weight_agg}")
     if cfg.train.disease_freq_weight_clip < 0:
@@ -842,6 +893,7 @@ def main() -> None:
         f"split_protocol={cfg.split.protocol} "
         f"split_mode={cfg.split.mode} split_only={split_only} "
         f"graph_visibility={cfg.train.graph_visibility} "
+        f"graph_cache_refresh_steps={cfg.train.graph_cache_refresh_steps} "
         f"main_temp={cfg.train.main_temperature:.4f} early_stop={cfg.train.main_early_stop_metric} "
         f"domain_loss={cfg.train.domain_loss_type} domain_data={cfg.train.domain_data_mode} "
         f"domain_cap={cfg.train.domain_train_per_label_cap} "
@@ -1222,7 +1274,14 @@ def main() -> None:
     )
     if not train_seen_diseases:
         raise ValueError("No train diseases with trait mappings remain after preprocessing")
-    train_disease_ids = train_seen_diseases if cfg.split.protocol == "disease_holdout" else all_disease_ids
+    # Transductive: all diseases in CLIP bank regardless of split.
+    # Novel diseases participate as negatives; their labels are never used.
+    train_disease_ids = all_disease_ids
+    train_seen_disease_set = set(train_seen_diseases)
+    val_heldout_disease_ids: List[int] = []
+    if cfg.split.protocol == "disease_holdout":
+        val_diseases = set(main_val["disease_index"].astype(int).tolist()) & set(all_disease_ids)
+        val_heldout_disease_ids = sorted(val_diseases - train_seen_disease_set)
     print(
         "disease_bank="
         + json.dumps(
@@ -1230,6 +1289,7 @@ def main() -> None:
                 "train_bank_size": int(len(train_disease_ids)),
                 "eval_bank_size": int(len(all_disease_ids)),
                 "heldout_eval_only": int(len(set(all_disease_ids) - set(train_disease_ids))),
+                "val_heldout_diseases": int(len(val_heldout_disease_ids)),
             },
             ensure_ascii=False,
         )
@@ -1627,7 +1687,11 @@ def main() -> None:
         lr_graph=cfg.train.lr_graph,
         weight_decay=cfg.train.weight_decay,
         graph_train_mode=cfg.train.graph_train_mode,
+        lr_disease_encoder=cfg.train.lr_disease_encoder,
         logit_scale_lr_mult=cfg.train.main_logit_scale_lr_mult,
+        scheduler_t0=cfg.train.scheduler_t0,
+        scheduler_t_mult=cfg.train.scheduler_t_mult,
+        scheduler_eta_min=cfg.train.scheduler_eta_min,
     )
     train_result = train_multitask(
         model=model,
@@ -1678,6 +1742,7 @@ def main() -> None:
         device=device,
         output_dir=str(out_dir),
         eval_disease_ids=all_disease_ids,
+        val_heldout_disease_ids=val_heldout_disease_ids if val_heldout_disease_ids else None,
         vd_kl_teacher=vd_kl_teacher,
         enable_vd_kl=(cfg.train.enable_vd_kl and vd_kl_teacher is not None),
         vd_kl_lambda_v2d=cfg.train.vd_kl_lambda_v2d,
@@ -1699,10 +1764,12 @@ def main() -> None:
         vd_kl_d2v_random_negatives=cfg.train.vd_kl_d2v_random_negatives,
         vd_kl_d2v_max_positive_variants=cfg.train.vd_kl_d2v_max_positive_variants,
         vd_kl_adaptive_weight=cfg.train.vd_kl_adaptive_weight,
-        vd_kl_adaptive_target_scale=cfg.train.vd_kl_adaptive_target_scale,
+        vd_kl_adaptive_reference_scale=cfg.train.vd_kl_adaptive_reference_scale,
         label_smoothing=cfg.train.label_smoothing,
         graph_warmup_epochs=cfg.train.graph_warmup_epochs,
         graph_warmup_lr=cfg.train.lr_graph_warmup,
+        graph_cache_refresh_steps=cfg.train.graph_cache_refresh_steps,
+        eval_interval=cfg.train.eval_interval,
     )
 
     best_gate_temperature = float(train_result.get("best_gate_temperature", 1.0))
@@ -1840,6 +1907,7 @@ def main() -> None:
         "split_protocol": cfg.split.protocol,
         "graph_visibility": cfg.train.graph_visibility,
         "graph_train_mode": cfg.train.graph_train_mode,
+        "graph_cache_refresh_steps": int(cfg.train.graph_cache_refresh_steps),
         "graph_mode": cfg.model.graph_mode,
         "split_input_signature": split_input_signature,
         "enable_vd_kl": bool(cfg.train.enable_vd_kl and vd_kl_teacher is not None),
@@ -1895,6 +1963,44 @@ def main() -> None:
         "split_summary": split_summary,
         "gene_size_bucket_counts": gene_size_bucket_counts,
         "feature_stats": feature_stats,
+        "device": str(cfg.runtime.device),
+        "epochs": int(cfg.train.epochs),
+        "lr": float(cfg.train.lr),
+        "lr_graph": float(cfg.train.lr_graph),
+        "lr_disease_encoder": float(cfg.train.lr_disease_encoder),
+        "weight_decay": float(cfg.train.weight_decay),
+        "grad_clip_norm": float(cfg.train.grad_clip_norm),
+        "batch_size_main": int(cfg.train.batch_size_main),
+        "batch_size_domain": int(cfg.train.batch_size_domain),
+        "batch_size_func": int(cfg.train.batch_size_func),
+        "early_stopping_patience": int(cfg.train.early_stopping_patience),
+        "scheduler_t0": int(cfg.train.scheduler_t0),
+        "scheduler_t_mult": int(cfg.train.scheduler_t_mult),
+        "scheduler_eta_min": float(cfg.train.scheduler_eta_min),
+        "hidden_dim": int(cfg.model.hidden_dim),
+        "out_dim": int(cfg.model.out_dim),
+        "num_heads": int(cfg.model.num_heads),
+        "num_graph_layers": int(cfg.model.num_graph_layers),
+        "dropout": float(cfg.model.dropout),
+        "residual_alpha_max": float(cfg.model.residual_alpha_max),
+        "modality_drop_variant": float(cfg.model.modality_drop_variant),
+        "modality_drop_protein": float(cfg.model.modality_drop_protein),
+        "modality_drop_gene": float(cfg.model.modality_drop_gene),
+        "trait_dropout": float(cfg.model.trait_dropout),
+        "disease_size_embed": bool(cfg.model.disease_size_embed),
+        "enrich_trait_graph": bool(cfg.model.enrich_trait_graph),
+        "main_logit_scale_learnable": bool(cfg.train.main_logit_scale_learnable),
+        "main_logit_scale_init": float(cfg.train.main_logit_scale_init),
+        "main_logit_scale_min": float(cfg.train.main_logit_scale_min),
+        "main_logit_scale_max": float(cfg.train.main_logit_scale_max),
+        "main_logit_scale_lr_mult": float(cfg.train.main_logit_scale_lr_mult),
+        "main_loss_type": cfg.train.main_loss_type,
+        "label_smoothing": float(cfg.train.label_smoothing),
+        "loss_weight_main": float(cfg.loss_weights.main),
+        "loss_weight_domain": float(cfg.loss_weights.domain),
+        "loss_weight_func": float(cfg.loss_weights.func),
+        "vd_kl_adaptive_weight": bool(cfg.train.vd_kl_adaptive_weight),
+        "vd_kl_adaptive_reference_scale": float(cfg.train.vd_kl_adaptive_reference_scale),
         "main_temperature": float(cfg.train.main_temperature),
         "domain_loss_type": cfg.train.domain_loss_type,
         "domain_contrastive_negatives": int(cfg.train.domain_contrastive_negatives),

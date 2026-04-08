@@ -61,11 +61,9 @@ def _safe_binary_auc_from_positive_mask(
     if n_pos == 0 or n_neg == 0:
         return None
 
-    scores = scores.to(torch.float32)
-    pos_scores = scores[positive_mask]
-    neg_scores = scores[~positive_mask]
-    comp = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)
-    auc = ((comp > 0).to(torch.float32) + 0.5 * (comp == 0).to(torch.float32)).mean()
+    ranks = _rankdata(scores.to(torch.float32))
+    sum_rank_pos = ranks[positive_mask].sum()
+    auc = (sum_rank_pos - (n_pos * (n_pos + 1) / 2.0)) / (n_pos * n_neg)
     return float(auc.item())
 
 
@@ -345,6 +343,8 @@ def evaluate_main(
     collect_gate_stats: bool = False,
     restrict_to_disease_ids: Optional[Sequence[int]] = None,
     gate_temperature: float = 1.0,
+    compute_heavy_metrics: bool = True,
+    minimal: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     use_amp = device.type == "cuda"
@@ -481,60 +481,68 @@ def evaluate_main(
                     continue
                 row_scores = scores[i]
                 pos_idx = torch.as_tensor(cols, dtype=torch.long, device=row_scores.device)
-                rr_contrib, recall_probs = _tie_aware_best_positive_metrics(
-                    row_scores, pos_idx, recall_ks
-                )
-
-                rr_sum += rr_contrib
-                for k, hit_prob in recall_probs.items():
-                    recall_counts[k] += hit_prob
-                positive_mask = torch.zeros(
-                    len(eval_disease_ids),
-                    dtype=torch.bool,
-                    device=row_scores.device,
-                )
-                positive_mask.index_fill_(0, pos_idx, True)
-                if disease_freq_buckets:
-                    bucket_cols_map: Dict[str, List[int]] = {}
-                    for col in cols:
-                        bucket_name = disease_bucket_by_col[int(col)]
-                        if bucket_name is None:
-                            continue
-                        bucket_cols_map.setdefault(bucket_name, []).append(int(col))
-                    for bucket_name, bucket_cols in bucket_cols_map.items():
-                        if not bucket_cols:
-                            continue
-                        bucket_pos_idx = torch.as_tensor(
-                            bucket_cols, dtype=torch.long, device=row_scores.device
-                        )
-                        bucket_rr_contrib, bucket_recall_probs = _tie_aware_best_positive_metrics(
-                            row_scores,
-                            bucket_pos_idx,
-                            recall_ks,
-                        )
-                        bucket_rr_sum[bucket_name] += bucket_rr_contrib
-                        for k, hit_prob in bucket_recall_probs.items():
-                            bucket_hits[bucket_name][k] += hit_prob
-                        bucket_ndcg_sum[bucket_name] += _ndcg_at_k_from_positive_indices(
-                            row_scores,
-                            bucket_pos_idx,
-                            k=10,
-                        )
-                        bucket_n[bucket_name] += 1
 
                 ndcg = _ndcg_at_k_from_positive_indices(row_scores, pos_idx, k=10)
                 ndcg_sum += ndcg
                 gene_key = int(gene_idx_cpu[i].item())
                 gene_query_ndcg_sum[gene_key] = gene_query_ndcg_sum.get(gene_key, 0.0) + ndcg
                 gene_query_ndcg_count[gene_key] = gene_query_ndcg_count.get(gene_key, 0) + 1
-                auc = _safe_binary_auc_from_positive_mask(row_scores, positive_mask)
-                ap = _safe_average_precision_from_positive_mask(row_scores, positive_mask)
-                if auc is not None:
-                    query_auroc_sum += auc
-                    query_auroc_n += 1
-                if ap is not None:
-                    query_auprc_sum += ap
-                    query_auprc_n += 1
+                rr_contrib, recall_probs = _tie_aware_best_positive_metrics(
+                    row_scores, pos_idx, recall_ks
+                )
+                rr_sum += rr_contrib
+                for k, hit_prob in recall_probs.items():
+                    recall_counts[k] += hit_prob
+
+                if not minimal:
+                    if disease_freq_buckets:
+                        positive_mask = torch.zeros(
+                            len(eval_disease_ids),
+                            dtype=torch.bool,
+                            device=row_scores.device,
+                        )
+                        positive_mask.index_fill_(0, pos_idx, True)
+                        bucket_cols_map: Dict[str, List[int]] = {}
+                        for col in cols:
+                            bucket_name = disease_bucket_by_col[int(col)]
+                            if bucket_name is None:
+                                continue
+                            bucket_cols_map.setdefault(bucket_name, []).append(int(col))
+                        for bucket_name, bucket_cols in bucket_cols_map.items():
+                            if not bucket_cols:
+                                continue
+                            bucket_pos_idx = torch.as_tensor(
+                                bucket_cols, dtype=torch.long, device=row_scores.device
+                            )
+                            bucket_rr_contrib, bucket_recall_probs = _tie_aware_best_positive_metrics(
+                                row_scores,
+                                bucket_pos_idx,
+                                recall_ks,
+                            )
+                            bucket_rr_sum[bucket_name] += bucket_rr_contrib
+                            for k, hit_prob in bucket_recall_probs.items():
+                                bucket_hits[bucket_name][k] += hit_prob
+                            bucket_ndcg_sum[bucket_name] += _ndcg_at_k_from_positive_indices(
+                                row_scores,
+                                bucket_pos_idx,
+                                k=10,
+                            )
+                            bucket_n[bucket_name] += 1
+                    if compute_heavy_metrics:
+                        positive_mask_hm = torch.zeros(
+                            len(eval_disease_ids),
+                            dtype=torch.bool,
+                            device=row_scores.device,
+                        )
+                        positive_mask_hm.index_fill_(0, pos_idx, True)
+                        auc = _safe_binary_auc_from_positive_mask(row_scores, positive_mask_hm)
+                        ap = _safe_average_precision_from_positive_mask(row_scores, positive_mask_hm)
+                        if auc is not None:
+                            query_auroc_sum += auc
+                            query_auroc_n += 1
+                        if ap is not None:
+                            query_auprc_sum += ap
+                            query_auprc_n += 1
                 n += 1
 
     if n == 0:
@@ -570,11 +578,12 @@ def evaluate_main(
             out["restricted_disease_bank_size"] = float(len(eval_disease_ids))
         return out
 
+    min_gene_queries = 3
     gene_macro_ndcg_sum = 0.0
     gene_macro_ndcg_n = 0
     for gene_key, gene_ndcg_total in gene_query_ndcg_sum.items():
         gene_count = gene_query_ndcg_count.get(gene_key, 0)
-        if gene_count <= 0:
+        if gene_count < min_gene_queries:
             continue
         gene_mean_ndcg = float(gene_ndcg_total / gene_count)
         gene_macro_ndcg_sum += gene_mean_ndcg

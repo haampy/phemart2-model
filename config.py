@@ -80,19 +80,22 @@ class TrainConfig:
     batch_size_domain: int = 128
     batch_size_func: int = 128
     lr: float = 1e-3
-    lr_graph: float = 1e-4
-    lr_graph_warmup: float = 1e-3  # match main LR during warmup so graph encoder catches up
-    graph_warmup_epochs: int = 10  # first 10 epochs: graph trains at lr_graph_warmup
+    lr_graph: float = 1e-6  # micro LR: graph fine-tunes minimally; high LR causes random-walk degradation
+    lr_disease_encoder: float = 1e-4  # DiseaseEncoder (attention+MLP) has no pretrained weights; needs higher LR than graph
+    lr_graph_warmup: float = 0.0  # disabled by default; if enabled, warmup period auto-uses refresh=1
+    graph_warmup_epochs: int = 0  # disabled by default
     graph_train_mode: str = "weak"  # {"frozen", "weak", "full"}
+    graph_cache_refresh_steps: int = 8  # post-warmup refresh interval; during warmup forced to 1
     graph_visibility: str = "transductive"  # {"inductive", "transductive"}
     weight_decay: float = 1e-2
     grad_clip_norm: float = 5.0
+    eval_interval: int = 1
     early_stopping_patience: int = 20
     main_temperature: float = 0.22
-    main_early_stop_metric: str = "main.gene_macro_ndcg@10"
+    main_early_stop_metric: str = "main.ndcg@10"
     main_logit_scale_learnable: bool = True
     main_logit_scale_min: float = 1.0
-    main_logit_scale_max: float = 30.0
+    main_logit_scale_max: float = 15.0
     main_logit_scale_init: float = 0.0  # 0 = auto from 1/temperature; for main_temperature=0.22 this is ≈ 4.5
     main_logit_scale_lr_mult: float = 1.0  # logit_scale LR = main LR × this multiplier
     domain_temperature: float = 0.15
@@ -118,6 +121,9 @@ class TrainConfig:
     disease_freq_reweight: str = "sqrt_inv"  # {"none", "sqrt_inv", "log_inv"}
     disease_freq_weight_agg: str = "max"  # {"max", "mean"}
     disease_freq_weight_clip: float = 0.0  # <=0 means no clip
+    scheduler_t0: int = 20  # CosineAnnealingWarmRestarts T_0
+    scheduler_t_mult: int = 2  # CosineAnnealingWarmRestarts T_mult
+    scheduler_eta_min: float = 1e-6  # CosineAnnealingWarmRestarts eta_min
     report_min_effect_mrr: float = 0.01
     report_min_effect_r10_rel: float = 0.03
     enable_vd_kl: bool = False
@@ -126,10 +132,10 @@ class TrainConfig:
     vd_kl_lambda_d2v: float = 0.1
     vd_kl_lambda_v2d_start: float = 0.0
     vd_kl_lambda_d2v_start: float = 0.0
-    vd_kl_lambda_ramp_epochs: int = 6
+    vd_kl_lambda_ramp_epochs: int = 8
     vd_kl_temperature: float = 0.15
-    vd_kl_warmup_epochs: int = 2
-    vd_kl_d2v_start_epoch: int = 4
+    vd_kl_warmup_epochs: int = 3
+    vd_kl_d2v_start_epoch: int = 8
     vd_kl_cache_refresh_interval: int = 1
     vd_kl_d2v_batch_size: int = 32
     vd_kl_hpo_topk_per_hpo: int = 5
@@ -147,8 +153,8 @@ class TrainConfig:
     vd_kl_d2v_teacher_topk: int = 32
     vd_kl_d2v_random_negatives: int = 128
     vd_kl_d2v_max_positive_variants: int = 8
-    vd_kl_adaptive_weight: bool = False  # scale KL weight by target_scale / current_logit_scale
-    vd_kl_adaptive_target_scale: float = 10.0  # logit_scale below this → KL gets full weight; above → KL attenuates
+    vd_kl_adaptive_weight: bool = False  # MUST be False; adaptive scaling causes runaway KL (see CLAUDE.md)
+    vd_kl_adaptive_reference_scale: float = 15.0  # reference logit_scale at which KL lambda equals its nominal value; above this, lambda scales up linearly
 
 
 @dataclass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -38,6 +39,37 @@ def _build_grad_scaler(enabled: bool):
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _forward_graph_embeddings(
+    model: MultiTaskModel,
+    graph,
+    device: torch.device,
+    requires_grad: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    grad_ctx = nullcontext() if requires_grad else torch.no_grad()
+    with grad_ctx:
+        # HGTConv/segment_matmul path in PyG currently requires FP32 here.
+        with torch.autocast(device_type=device.type, enabled=False):
+            return model.forward_graph(graph.x_dict, graph.edge_index_dict)
+
+
+def _compute_detached_graph_cache(
+    model: MultiTaskModel,
+    graph,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    was_training = model.training
+    model.eval()
+    gene_graph_emb, trait_graph_emb = _forward_graph_embeddings(
+        model=model,
+        graph=graph,
+        device=device,
+        requires_grad=False,
+    )
+    if was_training:
+        model.train()
+    return gene_graph_emb, trait_graph_emb
 
 
 def _refresh_vd_kl_variant_cache(
@@ -240,6 +272,8 @@ def evaluate_all_tasks(
     gene_size_buckets: Optional[Dict[str, Set[int]]] = None,
     collect_gate_stats: bool = False,
     gate_temperature: float = 1.0,
+    compute_heavy_metrics: bool = True,
+    minimal: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     use_amp = device.type == "cuda"
@@ -268,30 +302,33 @@ def evaluate_all_tasks(
             gene_size_buckets=gene_size_buckets,
             collect_gate_stats=collect_gate_stats,
             gate_temperature=gate_temperature,
+            compute_heavy_metrics=compute_heavy_metrics,
+            minimal=minimal,
         )
-    if loaders.get("domain") is not None and len(loaders["domain"]) > 0:
-        out["domain"] = evaluate_domain(
-            model,
-            loaders["domain"],
-            variant_x,
-            protein_x,
-            gene_graph_emb,
-            domain_embeddings,
-            device,
-            temperature=domain_temperature,
-            gate_temperature=gate_temperature,
-            seen_labels=domain_seen_labels,
-        )
-    if loaders.get("func") is not None and len(loaders["func"]) > 0:
-        out["func"] = evaluate_func(
-            model,
-            loaders["func"],
-            variant_x,
-            protein_x,
-            gene_graph_emb,
-            device,
-            gate_temperature=gate_temperature,
-        )
+    if not minimal:
+        if loaders.get("domain") is not None and len(loaders["domain"]) > 0:
+            out["domain"] = evaluate_domain(
+                model,
+                loaders["domain"],
+                variant_x,
+                protein_x,
+                gene_graph_emb,
+                domain_embeddings,
+                device,
+                temperature=domain_temperature,
+                gate_temperature=gate_temperature,
+                seen_labels=domain_seen_labels,
+            )
+        if loaders.get("func") is not None and len(loaders["func"]) > 0:
+            out["func"] = evaluate_func(
+                model,
+                loaders["func"],
+                variant_x,
+                protein_x,
+                gene_graph_emb,
+                device,
+                gate_temperature=gate_temperature,
+            )
     return out
 
 
@@ -357,12 +394,15 @@ def train_multitask(
     vd_kl_d2v_teacher_topk: int = 32,
     vd_kl_d2v_random_negatives: int = 128,
     vd_kl_d2v_max_positive_variants: int = 8,
-    vd_kl_adaptive_weight: bool = False,
-    vd_kl_adaptive_target_scale: float = 10.0,
+    vd_kl_adaptive_weight: bool = True,
+    vd_kl_adaptive_reference_scale: float = 15.0,
     label_smoothing: float = 0.0,
     graph_warmup_epochs: int = 0,
     graph_warmup_lr: float = 0.0,
+    graph_cache_refresh_steps: int = 1,
     graph_param_group_index: int = 1,
+    val_heldout_disease_ids: Optional[Sequence[int]] = None,
+    eval_interval: int = 1,
 ) -> Dict[str, object]:
     main_loss_type = main_loss_type.lower()
     func_regression_loss_type = func_regression_loss_type.lower()
@@ -387,6 +427,8 @@ def train_multitask(
     vd_kl_d2v_teacher_topk = max(int(vd_kl_d2v_teacher_topk), 1)
     vd_kl_d2v_random_negatives = max(int(vd_kl_d2v_random_negatives), 0)
     vd_kl_d2v_max_positive_variants = max(int(vd_kl_d2v_max_positive_variants), 1)
+    graph_cache_refresh_steps = max(int(graph_cache_refresh_steps), 1)
+    eval_interval = max(int(eval_interval), 1)
     func_column_scales = func_column_scales.to(device)
 
     metric_lower_is_better = any(
@@ -418,22 +460,26 @@ def train_multitask(
 
     # Graph embedding caching strategy:
     # - frozen: compute once before training, never recompute
-    # - weak/full: recompute once per epoch and reuse inside the epoch
+    # - weak/full: recompute with gradients every K optimizer steps, and
+    #   rebuild a detached cache after each graph update for the interim steps
     static_train_gene_graph_emb = None
     static_train_trait_graph_emb = None
-    cache_graph_per_epoch = graph_encoder_trainable
+    cached_train_gene_graph_emb = None
+    cached_train_trait_graph_emb = None
+    steps_until_graph_refresh = 0
     if not graph_encoder_trainable:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            with torch.autocast(device_type=device.type, enabled=False):
-                static_train_gene_graph_emb, static_train_trait_graph_emb = model.forward_graph(
-                    graph.x_dict,
-                    graph.edge_index_dict,
-                )
-        if was_training:
-            model.train()
-        cache_graph_per_epoch = False
+        static_train_gene_graph_emb, static_train_trait_graph_emb = _compute_detached_graph_cache(
+            model=model,
+            graph=graph,
+            device=device,
+        )
+    if graph_encoder_trainable:
+        graph_cache_mode = (
+            "per_step" if graph_cache_refresh_steps == 1 else f"refresh_every_{graph_cache_refresh_steps}_steps"
+        )
+    else:
+        graph_cache_mode = "static_frozen"
+    print(f"graph_cache_mode={graph_cache_mode}")
 
     vd_pool_variant_idx_t = None
     vd_pool_gene_idx_t = None
@@ -462,6 +508,7 @@ def train_multitask(
     main_warmup_active = bool(has_main_loader and main_only_warmup_epochs > 0)
     tracked_params: Dict[str, Dict[str, torch.Tensor]] = {}
     for mod_name, mod in [
+        ("graph_enc", model.graph_encoder),
         ("variant_enc", model.variant_encoder),
         ("protein_enc", model.protein_encoder),
         ("fusion", model.fusion),
@@ -498,16 +545,6 @@ def train_multitask(
             )
 
         model.train()
-        if cache_graph_per_epoch:
-            model.eval()
-            with torch.no_grad():
-                with torch.autocast(device_type=device.type, enabled=False):
-                    static_train_gene_graph_emb, static_train_trait_graph_emb = model.forward_graph(
-                        graph.x_dict,
-                        graph.edge_index_dict,
-                    )
-            model.train()
-
         task_iters = {
             name: iter(loader)
             for name, loader in train_loaders.items()
@@ -535,6 +572,7 @@ def train_multitask(
         epoch_vd_d2v_low_row_steps = 0
         epoch_grad_norm_sum = 0.0
         epoch_grad_norm_steps = 0
+        epoch_graph_refreshes = 0
         epoch_task_steps = {"main": 0, "domain": 0, "func": 0, "vd_d2v": 0}
         epoch_task_rows = {"main": 0, "domain": 0, "func": 0, "vd_d2v": 0}
         epoch_loss_term_sum: Dict[str, float] = {}
@@ -595,19 +633,37 @@ def train_multitask(
             )
             epoch_vd_cache_refreshed = 1
 
+        # During graph warmup (high LR), refresh every step to avoid stale cache.
+        # After warmup, use the configured refresh interval.
+        effective_graph_refresh = (
+            1 if (graph_warmup_active and epoch <= graph_warmup_epochs)
+            else graph_cache_refresh_steps
+        )
+
         for step_idx in range(1, max_steps + 1):
             optimizer.zero_grad(set_to_none=True)
             main_disease_emb = None
 
-            if static_train_gene_graph_emb is None or static_train_trait_graph_emb is None:
-                with torch.autocast(device_type=device.type, enabled=False):
-                    gene_graph_emb, trait_graph_emb = model.forward_graph(
-                        graph.x_dict,
-                        graph.edge_index_dict,
-                    )
-            else:
+            refresh_graph_this_step = False
+            if static_train_gene_graph_emb is not None and static_train_trait_graph_emb is not None:
                 gene_graph_emb = static_train_gene_graph_emb
                 trait_graph_emb = static_train_trait_graph_emb
+            else:
+                refresh_graph_this_step = (
+                    cached_train_gene_graph_emb is None
+                    or cached_train_trait_graph_emb is None
+                    or steps_until_graph_refresh <= 0
+                )
+                if refresh_graph_this_step:
+                    gene_graph_emb, trait_graph_emb = _forward_graph_embeddings(
+                        model=model,
+                        graph=graph,
+                        device=device,
+                        requires_grad=True,
+                    )
+                else:
+                    gene_graph_emb = cached_train_gene_graph_emb
+                    trait_graph_emb = cached_train_trait_graph_emb
             aux_gene_graph_emb = gene_graph_emb if aux_update_hgt else gene_graph_emb.detach()
 
             losses = {}
@@ -738,8 +794,9 @@ def train_multitask(
                                 effective_lambda_v2d = float(cur_vd_lambda_v2d)
                                 if vd_kl_adaptive_weight:
                                     cur_scale = float(main_logit_scale.detach().item()) if main_logit_scale is not None else 1.0
-                                    if cur_scale > 0:
-                                        adaptive_factor = min(vd_kl_adaptive_target_scale / cur_scale, 1.0)
+                                    ref_scale = float(vd_kl_adaptive_reference_scale)
+                                    if cur_scale > 0 and ref_scale > 0:
+                                        adaptive_factor = max(cur_scale / ref_scale, 1.0)
                                         effective_lambda_v2d *= adaptive_factor
                                 weighted_v2d = v2d_kl * effective_lambda_v2d
                                 losses["vd_kl_v2d"] = weighted_v2d
@@ -917,8 +974,9 @@ def train_multitask(
                                 effective_lambda_d2v = float(cur_vd_lambda_d2v)
                                 if vd_kl_adaptive_weight:
                                     cur_scale = float(main_logit_scale.detach().item()) if main_logit_scale is not None else 1.0
-                                    if cur_scale > 0:
-                                        adaptive_factor = min(vd_kl_adaptive_target_scale / cur_scale, 1.0)
+                                    ref_scale = float(vd_kl_adaptive_reference_scale)
+                                    if cur_scale > 0 and ref_scale > 0:
+                                        adaptive_factor = max(cur_scale / ref_scale, 1.0)
                                         effective_lambda_d2v *= adaptive_factor
                                 weighted_d2v = d2v_kl * effective_lambda_d2v * row_count_scale
                                 losses["vd_kl_d2v"] = weighted_d2v
@@ -1038,6 +1096,23 @@ def train_multitask(
                 loss.backward()
                 grad_norm = float(clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm))
                 optimizer.step()
+            if refresh_graph_this_step:
+                epoch_graph_refreshes += 1
+                if effective_graph_refresh > 1:
+                    cached_train_gene_graph_emb, cached_train_trait_graph_emb = _compute_detached_graph_cache(
+                        model=model,
+                        graph=graph,
+                        device=device,
+                    )
+                    gene_graph_emb = cached_train_gene_graph_emb
+                    trait_graph_emb = cached_train_trait_graph_emb
+                    steps_until_graph_refresh = effective_graph_refresh - 1
+                else:
+                    cached_train_gene_graph_emb = None
+                    cached_train_trait_graph_emb = None
+                    steps_until_graph_refresh = 0
+            elif graph_encoder_trainable and steps_until_graph_refresh > 0:
+                steps_until_graph_refresh -= 1
             if grad_norm >= 0:
                 epoch_grad_norm_sum += grad_norm
                 epoch_grad_norm_steps += 1
@@ -1048,27 +1123,58 @@ def train_multitask(
         if scheduler is not None:
             scheduler.step()
 
-        val_metrics = evaluate_all_tasks(
-            model=model,
-            graph=eval_graph,
-            loaders=val_loaders,
-            variant_x=variant_x,
-            protein_x=protein_x,
-            domain_embeddings=domain_embeddings,
-            disease_ids=eval_disease_ids,
-            disease_to_traits=disease_to_traits,
-            device=device,
-            domain_temperature=domain_temperature,
-            domain_seen_labels=domain_seen_labels,
-            disease_freq_buckets=disease_freq_buckets,
-            gene_size_buckets=gene_size_buckets,
-            gate_temperature=gate_temperature,
-        )
-        metric_path = [p.strip() for p in early_stop_metric.split(".") if p.strip()]
-        if len(metric_path) == 2:
-            metric_value = float(val_metrics.get(metric_path[0], {}).get(metric_path[1], 0.0))
+        should_eval = (epoch % eval_interval == 0) or (epoch == epochs - 1)
+        if should_eval:
+            val_metrics = evaluate_all_tasks(
+                model=model,
+                graph=eval_graph,
+                loaders=val_loaders,
+                variant_x=variant_x,
+                protein_x=protein_x,
+                domain_embeddings=domain_embeddings,
+                disease_ids=eval_disease_ids,
+                disease_to_traits=disease_to_traits,
+                device=device,
+                domain_temperature=domain_temperature,
+                domain_seen_labels=domain_seen_labels,
+                disease_freq_buckets=disease_freq_buckets,
+                gene_size_buckets=gene_size_buckets,
+                gate_temperature=gate_temperature,
+                compute_heavy_metrics=False,
+                minimal=True,
+            )
+            if (val_heldout_disease_ids is not None
+                    and len(val_heldout_disease_ids) > 0
+                    and "main_heldout" in early_stop_metric):
+                main_loader_val = val_loaders.get("main")
+                if main_loader_val is not None and len(main_loader_val) > 0:
+                    with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
+                        gene_graph_emb_h, trait_graph_emb_h = model.forward_graph(
+                            eval_graph.x_dict, eval_graph.edge_index_dict
+                        )
+                    val_heldout_metrics = evaluate_main(
+                        model,
+                        main_loader_val,
+                        variant_x,
+                        protein_x,
+                        gene_graph_emb_h,
+                        trait_graph_emb_h,
+                        eval_disease_ids,
+                        disease_to_traits,
+                        device,
+                        restrict_to_disease_ids=val_heldout_disease_ids,
+                        gate_temperature=gate_temperature,
+                        minimal=True,
+                    )
+                    val_metrics["main_heldout"] = val_heldout_metrics
+            metric_path = [p.strip() for p in early_stop_metric.split(".") if p.strip()]
+            if len(metric_path) == 2:
+                metric_value = float(val_metrics.get(metric_path[0], {}).get(metric_path[1], 0.0))
+            else:
+                metric_value = float(val_metrics.get("main", {}).get("mrr", 0.0))
         else:
-            metric_value = float(val_metrics.get("main", {}).get("mrr", 0.0))
+            val_metrics = {}
+            metric_value = None
         avg_epoch_loss = epoch_loss / max(step_count, 1)
         avg_gate_entropy = epoch_gate_entropy / max(epoch_gate_entropy_steps, 1)
         avg_vd_kl_v2d = epoch_vd_kl_v2d / max(step_count, 1)
@@ -1114,6 +1220,7 @@ def train_multitask(
             "aux_tasks_active": bool(aux_tasks_active),
             "vd_kl_lambda_v2d": float(cur_vd_lambda_v2d),
             "vd_kl_lambda_d2v": float(cur_vd_lambda_d2v),
+            "vd_kl_adaptive_factor": float(max(main_logit_scale_val / float(vd_kl_adaptive_reference_scale), 1.0)) if (vd_kl_adaptive_weight and vd_kl_adaptive_reference_scale > 0) else 1.0,
             "vd_kl_v2d": avg_vd_kl_v2d,
             "vd_kl_d2v": avg_vd_kl_d2v,
             "vd_kl_v2d_rows": int(epoch_vd_kl_v2d_rows),
@@ -1125,6 +1232,8 @@ def train_multitask(
             "vd_d2v_anchor_mass_count": int(epoch_vd_d2v_anchor_mass_count),
             "vd_d2v_skipped_steps": int(epoch_vd_d2v_skipped_steps),
             "vd_d2v_low_row_steps": int(epoch_vd_d2v_low_row_steps),
+            "graph_refreshes": int(epoch_graph_refreshes),
+            "graph_cache_refresh_steps": int(graph_cache_refresh_steps),
             "task_steps": {k: int(v) for k, v in epoch_task_steps.items()},
             "task_rows": {k: int(v) for k, v in epoch_task_rows.items()},
             "val_metrics": val_metrics,
@@ -1136,6 +1245,7 @@ def train_multitask(
 
         residual_str = f" res_alpha={residual_alpha_val:.4f}" if residual_alpha_val is not None else ""
         grad_str = f" grad_norm={avg_grad_norm:.4f}"
+        graph_str = f" graph_refreshes={epoch_graph_refreshes}"
         gate_str = ""
         if gate_entropy_weight > 0:
             gate_str = f" gate_entropy={avg_gate_entropy:.4f} gate_lambda={gate_entropy_weight:.6f}"
@@ -1185,7 +1295,7 @@ def train_multitask(
         param_str = ""
         if tracked_params:
             tracked = []
-            for k in ["variant_enc_delta_l2", "clip_v_delta_l2", "clip_d_delta_l2", "fusion_delta_l2"]:
+            for k in ["graph_enc_delta_l2", "variant_enc_delta_l2", "clip_v_delta_l2", "clip_d_delta_l2", "fusion_delta_l2"]:
                 if k in param_delta:
                     tracked.append(f"{k}={param_delta[k]:.4f}")
             if tracked:
@@ -1208,50 +1318,62 @@ def train_multitask(
                 f"{main_val.get('bucket_frequent_recall@10', 0.0):.4f}/"
                 f"{main_val.get('bucket_frequent_ndcg@10', 0.0):.4f}"
             )
+        if should_eval:
+            val_str = (
+                f"val_metric({early_stop_metric})={metric_value:.4f} "
+                f"val_mrr={main_val.get('mrr', 0.0):.4f} "
+                f"val_r1={main_val.get('recall@1', 0.0):.4f} "
+                f"val_r5={main_val.get('recall@5', 0.0):.4f} "
+                f"val_r10={main_val.get('recall@10', 0.0):.4f} "
+                f"val_ndcg10={main_val.get('ndcg@10', 0.0):.4f} "
+                f"val_gene_macro_ndcg10={main_val.get('gene_macro_ndcg@10', 0.0):.4f}"
+                f"{bucket_log}"
+            )
+        else:
+            val_str = "[eval_skipped]"
         print(
             f"epoch={epoch} train_loss={avg_epoch_loss:.4f} "
             f"logit_scale={main_logit_scale_val:.4f}"
-            f"{grad_str}"
+            f"{grad_str}{graph_str}"
             f"{gate_str}{vd_kl_str}{warmup_str}{residual_str}{task_usage_str} "
             f"{loss_term_str}{param_str} "
-            f"val_metric({early_stop_metric})={metric_value:.4f} "
-            f"val_mrr={main_val.get('mrr', 0.0):.4f} "
-            f"val_r1={main_val.get('recall@1', 0.0):.4f} "
-            f"val_r5={main_val.get('recall@5', 0.0):.4f} "
-            f"val_r10={main_val.get('recall@10', 0.0):.4f} "
-            f"val_ndcg10={main_val.get('ndcg@10', 0.0):.4f} "
-            f"val_gene_macro_ndcg10={main_val.get('gene_macro_ndcg@10', 0.0):.4f}"
-            f"{bucket_log}"
+            f"{val_str}"
         )
 
-        is_better = (
-            metric_value < best_metric_value
-            if metric_lower_is_better
-            else metric_value > best_metric_value
-        )
-        if is_better:
-            best_metric_value = metric_value
-            best_epoch = int(epoch)
-            best_val_metrics = deepcopy(val_metrics)
-            best_gate_temperature = gate_temperature
-            wait = 0
-            best_state = deepcopy(model.state_dict())
-            ckpt_payload = {
-                "model_state_dict": best_state,
-                "epoch": epoch,
-                "best_metric_name": early_stop_metric,
-                "best_metric": best_metric_value,
-                "best_gate_temperature": float(best_gate_temperature),
-                "gene_graph_emb": gene_graph_emb.detach().cpu(),
-                "trait_graph_emb": trait_graph_emb.detach().cpu(),
-            }
-            torch.save(ckpt_payload, ckpt_path)
-        else:
-            wait += 1
+        if should_eval and metric_value is not None:
+            is_better = (
+                metric_value < best_metric_value
+                if metric_lower_is_better
+                else metric_value > best_metric_value
+            )
+            if is_better:
+                best_metric_value = metric_value
+                best_epoch = int(epoch)
+                best_val_metrics = deepcopy(val_metrics)
+                best_gate_temperature = gate_temperature
+                wait = 0
+                best_state = deepcopy(model.state_dict())
+                best_gene_graph_emb, best_trait_graph_emb = _compute_detached_graph_cache(
+                    model=model,
+                    graph=graph,
+                    device=device,
+                )
+                ckpt_payload = {
+                    "model_state_dict": best_state,
+                    "epoch": epoch,
+                    "best_metric_name": early_stop_metric,
+                    "best_metric": best_metric_value,
+                    "best_gate_temperature": float(best_gate_temperature),
+                    "gene_graph_emb": best_gene_graph_emb.detach().cpu(),
+                    "trait_graph_emb": best_trait_graph_emb.detach().cpu(),
+                }
+                torch.save(ckpt_payload, ckpt_path)
+            else:
+                wait += 1
 
         gate_temperature = max(gate_temperature * 0.9, 0.1)
 
-        if wait >= early_stopping_patience:
+        if should_eval and wait >= early_stopping_patience:
             print(
                 f"early_stop_at_epoch={epoch} "
                 f"best_{early_stop_metric}={best_metric_value:.4f}"
