@@ -12,27 +12,21 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from data import VariantDiseaseKLTeacher
-from eval import evaluate_domain, evaluate_func, evaluate_main
+from eval import _amp_cuda_dtype, evaluate_domain, evaluate_func, evaluate_main
 from data import FUNC_AXIS_SLICES
 from losses import (
+    concept_regression_loss,
     domain_sampled_infonce_loss,
     func_multiaxis_loss,
     main_multi_positive_bce_loss,
     main_multi_positive_softmax_loss,
+    sparse_set_infonce_from_log_probs,
+    sparse_slack_constraint_from_log_probs,
     sparse_teacher_kl_from_log_probs,
+    sparse_weighted_infonce_from_log_probs,
     total_loss,
 )
 from model import MultiTaskModel
-
-
-def _amp_cuda_dtype() -> torch.dtype:
-    if torch.cuda.is_available():
-        try:
-            if torch.cuda.is_bf16_supported():
-                return torch.bfloat16
-        except Exception:
-            pass
-    return torch.float16
 
 
 def _build_grad_scaler(enabled: bool):
@@ -376,6 +370,7 @@ def train_multitask(
     eval_disease_ids: Optional[Sequence[int]] = None,
     vd_kl_teacher: Optional[VariantDiseaseKLTeacher] = None,
     enable_vd_kl: bool = False,
+    vd_kl_loss_type: str = "kl",  # {"kl", "set_infonce"}
     vd_kl_lambda_v2d: float = 1.0,
     vd_kl_lambda_d2v: float = 0.1,
     vd_kl_lambda_v2d_start: float = 0.0,
@@ -396,6 +391,7 @@ def train_multitask(
     vd_kl_d2v_max_positive_variants: int = 8,
     vd_kl_adaptive_weight: bool = True,
     vd_kl_adaptive_reference_scale: float = 15.0,
+    vd_kl_slack_tau: float = 0.5,
     label_smoothing: float = 0.0,
     graph_warmup_epochs: int = 0,
     graph_warmup_lr: float = 0.0,
@@ -403,6 +399,11 @@ def train_multitask(
     graph_param_group_index: int = 1,
     val_heldout_disease_ids: Optional[Sequence[int]] = None,
     eval_interval: int = 1,
+    main_hard_negative_k: int = 0,
+    concept_targets: Optional[torch.Tensor] = None,
+    gene_to_concept_row: Optional[Dict[str, int]] = None,
+    idx_to_gene: Optional[Dict[int, str]] = None,
+    enable_concept_regression: bool = False,
 ) -> Dict[str, object]:
     main_loss_type = main_loss_type.lower()
     func_regression_loss_type = func_regression_loss_type.lower()
@@ -448,6 +449,17 @@ def train_multitask(
     domain_embeddings = domain_embeddings.to(device)
     graph = graph.to(device)
     eval_graph = eval_graph.to(device)
+    if concept_targets is not None:
+        concept_targets = concept_targets.to(device)
+
+    # 预构建 gene_idx -> concept_row 映射表 (整数到整数)
+    gene_idx_to_concept_row: Dict[int, int] = {}
+    if enable_concept_regression and gene_to_concept_row is not None and idx_to_gene is not None:
+        for g_idx, g_name in idx_to_gene.items():
+            g_upper = str(g_name).upper()
+            cr = gene_to_concept_row.get(g_upper)
+            if cr is not None:
+                gene_idx_to_concept_row[int(g_idx)] = int(cr)
     use_amp = device.type == "cuda"
     amp_dtype = _amp_cuda_dtype() if use_amp else torch.bfloat16
     use_grad_scaler = use_amp and amp_dtype == torch.float16
@@ -486,6 +498,7 @@ def train_multitask(
     vd_variant_idx_to_pool: Dict[int, int] = {}
     vd_variant_to_disease = {}
     vd_variant_mapped_mass: Dict[int, float] = {}
+    vd_variant_kl_weight: Dict[int, float] = {}
     vd_variant_to_disease_tensor_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
     vd_cache: Optional[torch.Tensor] = None
     if enable_vd_kl and vd_kl_teacher is not None and len(vd_kl_teacher.pool_variant_idx) > 0:
@@ -501,6 +514,9 @@ def train_multitask(
         vd_variant_to_disease = vd_kl_teacher.variant_to_disease
         vd_variant_mapped_mass = {
             int(k): float(v) for k, v in vd_kl_teacher.variant_mapped_mass.items()
+        }
+        vd_variant_kl_weight = {
+            int(k): float(v) for k, v in vd_kl_teacher.variant_kl_weight.items()
         }
 
     has_main_loader = train_loaders.get("main") is not None and len(train_loaders["main"]) > 0
@@ -734,6 +750,7 @@ def train_multitask(
                                 logit_scale=main_logit_scale,
                                 sample_weights=sample_weights,
                                 label_smoothing=label_smoothing,
+                                hard_negative_k=main_hard_negative_k,
                             )
 
                     if vd_kl_v2d_active and vd_cache is not None:
@@ -785,11 +802,27 @@ def train_multitask(
                         if cur_vd_lambda_v2d > 0:
                             logits_v2d = (z_v.float() @ z_d.float().t()) / max(float(vd_kl_temperature), 1e-6)
                             log_probs_v2d = F.log_softmax(logits_v2d, dim=1)
-                            v2d_kl, n_rows_v2d = sparse_teacher_kl_from_log_probs(
-                                log_probs_v2d,
-                                teacher_indices,
-                                teacher_probs,
+                            v2d_row_weights = [
+                                vd_variant_kl_weight.get(v_idx, 1.0) for v_idx in batch_variant_ids
+                            ] if vd_variant_kl_weight else None
+                            _loss_type_dispatch = {
+                                "set_infonce": sparse_set_infonce_from_log_probs,
+                                "weighted_set_infonce": sparse_weighted_infonce_from_log_probs,
+                                "kl": sparse_teacher_kl_from_log_probs,
+                                "slack_constraint": sparse_slack_constraint_from_log_probs,
+                            }
+                            _vd_loss_fn = _loss_type_dispatch.get(
+                                vd_kl_loss_type, sparse_teacher_kl_from_log_probs
                             )
+                            _loss_kwargs: dict = dict(
+                                log_probs=log_probs_v2d,
+                                teacher_indices=teacher_indices,
+                                teacher_probs=teacher_probs,
+                                row_weights=v2d_row_weights,
+                            )
+                            if vd_kl_loss_type == "slack_constraint":
+                                _loss_kwargs["tau"] = float(vd_kl_slack_tau)
+                            v2d_kl, n_rows_v2d = _vd_loss_fn(**_loss_kwargs)
                             if n_rows_v2d > 0:
                                 effective_lambda_v2d = float(cur_vd_lambda_v2d)
                                 if vd_kl_adaptive_weight:
@@ -964,7 +997,12 @@ def train_multitask(
                                     )
                             logits_d2v = (z_d_aux.float() @ z_v_aux.float().t()) / max(float(vd_kl_temperature), 1e-6)
                             log_probs_d2v = F.log_softmax(logits_d2v, dim=1)
-                            d2v_kl, n_rows_d2v = sparse_teacher_kl_from_log_probs(
+                            _vd_d2v_loss_fn = (
+                                sparse_set_infonce_from_log_probs
+                                if vd_kl_loss_type == "set_infonce"
+                                else sparse_teacher_kl_from_log_probs
+                            )
+                            d2v_kl, n_rows_d2v = _vd_d2v_loss_fn(
                                 log_probs_d2v,
                                 teacher_d2v_indices,
                                 teacher_d2v_probs,
@@ -1065,6 +1103,42 @@ def train_multitask(
                             mechanism_pos_weight=func_mechanism_pos_weight,
                         )
                     losses.update(func_losses)
+
+            # Concept regression: 从 main batch 的 gene_ids 取 concept target
+            if (
+                enable_concept_regression
+                and concept_targets is not None
+                and gene_idx_to_concept_row
+                and model.concept_regression_head is not None
+                and aux_tasks_active
+                and "main" in losses  # 仅当本 step 有 main loss 时
+            ):
+                # gene_idx 在 main 分支中已赋值
+                main_gene_idx = gene_idx
+                if main_gene_idx is not None:
+                    gene_ids_cpu = main_gene_idx.cpu().tolist()
+                    concept_rows = []
+                    mask_list = []
+                    for g in gene_ids_cpu:
+                        cr = gene_idx_to_concept_row.get(int(g))
+                        if cr is not None:
+                            concept_rows.append(cr)
+                            mask_list.append(True)
+                        else:
+                            concept_rows.append(0)
+                            mask_list.append(False)
+                    concept_mask = torch.tensor(mask_list, dtype=torch.bool, device=device)
+                    if concept_mask.any():
+                        concept_row_idx = torch.tensor(concept_rows, dtype=torch.long, device=device)
+                        concept_tgt = concept_targets.index_select(0, concept_row_idx)
+                        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                            concept_pred = model.forward_concept(
+                                main_gene_idx,
+                                aux_gene_graph_emb,
+                            )
+                            losses["concept"] = concept_regression_loss(
+                                concept_pred, concept_tgt, concept_mask,
+                            )
 
             if not losses:
                 continue

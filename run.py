@@ -5,7 +5,7 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,9 +13,7 @@ import torch
 
 from config import default_config, ensure_output_dir
 from data import (
-    FUNC_AXIS_SLICES,
     FUNC_REGRESSION_COLS,
-    FUNC_TARGET_COLS,
     apply_disease_split,
     apply_split,
     build_disease_frequency_buckets,
@@ -40,6 +38,7 @@ from data import (
     load_domain_labels,
     load_embeddings,
     load_func_labels,
+    load_gene_concept_targets,
     load_main_labels,
     load_split_artifact,
     make_dataloader_for_task,
@@ -136,6 +135,168 @@ def _build_train_selection_summary(
         summary[f"test_main_{key}"] = test_val
         summary[f"generalization_gap_{key}"] = float(best_val - test_val)
     return summary
+
+
+# --- arg → config 映射表 ---
+# (arg_name, config_section, config_field)
+# 当 arg_name == config_field 时可以省略第三项（用 None）
+_ARG_CFG_DIRECT: List[Tuple[str, str, Optional[str]]] = [
+    # runtime
+    ("num_workers", "runtime", None),
+    ("device", "runtime", None),
+    # split
+    ("seed", "split", None),
+    ("split_protocol", "split", "protocol"),
+    ("split_mode", "split", "mode"),
+    # paths
+    ("output_dir", "paths", None),
+    ("main_labels", "paths", None),
+    ("disease_table", "paths", None),
+    ("split_artifact_path", "paths", None),
+    ("mvp_hpo_semantic_map", "paths", None),
+    ("mvp_disease_concept_map", "paths", None),
+    ("mvp_topk_indices", "paths", None),
+    ("mvp_topk_values", "paths", None),
+    ("mvp_topk_metadata", "paths", None),
+    # loss_weights
+    ("loss_weight_main", "loss_weights", "main"),
+    ("loss_weight_domain", "loss_weights", "domain"),
+    ("loss_weight_func", "loss_weights", "func"),
+    ("loss_weight_concept", "loss_weights", "concept"),
+    # model
+    ("graph_mode", "model", None),
+    ("residual_alpha_max", "model", None),
+    ("modality_drop_variant", "model", None),
+    ("modality_drop_protein", "model", None),
+    ("modality_drop_gene", "model", None),
+    ("trait_dropout", "model", None),
+    ("fusion_type", "model", None),
+    ("num_graph_layers", "model", None),
+    ("hidden_dim", "model", None),
+    ("out_dim", "model", None),
+    # train — general
+    ("epochs", "train", None),
+    ("batch_size_main", "train", None),
+    ("batch_size_domain", "train", None),
+    ("batch_size_func", "train", None),
+    ("lr", "train", None),
+    ("lr_graph", "train", None),
+    ("lr_disease_encoder", "train", None),
+    ("lr_graph_warmup", "train", None),
+    ("graph_warmup_epochs", "train", None),
+    ("graph_cache_refresh_steps", "train", None),
+    ("weight_decay", "train", None),
+    ("grad_clip_norm", "train", None),
+    ("eval_interval", "train", None),
+    ("early_stopping_patience", "train", None),
+    ("main_temperature", "train", None),
+    ("domain_temperature", "train", None),
+    ("domain_loss_type", "train", None),
+    ("domain_contrastive_negatives", "train", None),
+    ("domain_data_mode", "train", None),
+    ("domain_train_per_label_cap", "train", None),
+    ("main_early_stop_metric", "train", None),
+    ("main_loss_type", "train", None),
+    ("main_logit_scale_min", "train", None),
+    ("main_logit_scale_max", "train", None),
+    ("main_logit_scale_init", "train", None),
+    ("main_logit_scale_lr_mult", "train", None),
+    ("label_smoothing", "train", None),
+    ("aux_domain_interval", "train", None),
+    ("aux_func_interval", "train", None),
+    ("main_only_warmup_epochs", "train", None),
+    ("gate_entropy_weight_start", "train", None),
+    ("gate_entropy_weight_end", "train", None),
+    ("graph_visibility", "train", None),
+    ("graph_train_mode", "train", None),
+    ("func_min_valid_axes", "train", None),
+    ("func_mechanism_pos_weight", "train", None),
+    ("func_train_per_gene_cap", "train", None),
+    ("min_train_records_func", "train", None),
+    ("disease_freq_reweight", "train", None),
+    ("disease_freq_weight_agg", "train", None),
+    ("disease_freq_weight_clip", "train", None),
+    ("main_hard_negative_k", "train", None),
+    ("scheduler_t0", "train", None),
+    ("scheduler_t_mult", "train", None),
+    ("scheduler_eta_min", "train", None),
+    # train — VD-KL
+    ("vd_kl_loss_type", "train", None),
+    ("vd_kl_teacher_mode", "train", None),
+    ("vd_kl_lambda_v2d", "train", None),
+    ("vd_kl_lambda_d2v", "train", None),
+    ("vd_kl_lambda_v2d_start", "train", None),
+    ("vd_kl_lambda_d2v_start", "train", None),
+    ("vd_kl_lambda_ramp_epochs", "train", None),
+    ("vd_kl_temperature", "train", None),
+    ("vd_kl_warmup_epochs", "train", None),
+    ("vd_kl_d2v_start_epoch", "train", None),
+    ("vd_kl_cache_refresh_interval", "train", None),
+    ("vd_kl_d2v_batch_size", "train", None),
+    ("vd_kl_hpo_topk_per_hpo", "train", None),
+    ("vd_kl_hpo_min_similarity", "train", None),
+    ("vd_kl_concept_direct_weight", "train", None),
+    ("vd_kl_concept_semantic_weight", "train", None),
+    ("vd_kl_min_variant_mapped_mass", "train", None),
+    ("vd_kl_max_diseases_per_variant", "train", None),
+    ("vd_kl_disease_score_concentration", "train", None),
+    ("vd_kl_max_diseases_per_concept", "train", None),
+    ("vd_kl_max_variants_per_disease", "train", None),
+    ("vd_kl_positive_smoothing", "train", None),
+    ("vd_kl_d2v_positive_smoothing", "train", None),
+    ("vd_kl_d2v_min_anchor_mass", "train", None),
+    ("vd_kl_d2v_min_rows_per_step", "train", None),
+    ("vd_kl_min_teacher_top1_prob", "train", None),
+    ("vd_kl_d2v_teacher_topk", "train", None),
+    ("vd_kl_d2v_random_negatives", "train", None),
+    ("vd_kl_d2v_max_positive_variants", "train", None),
+    ("vd_kl_adaptive_reference_scale", "train", None),
+    ("vd_kl_gene_propagation_alpha", "train", None),
+    ("vd_kl_gene_propagation_distance_lambda", "train", None),
+    ("vd_kl_gene_propagation_max_distance", "train", None),
+    ("vd_kl_gene_propagation_entropy_threshold", "train", None),
+    ("vd_kl_gene_propagation_position_unknown_penalty", "train", None),
+    ("vd_kl_bridge_length_penalty_b", "train", None),
+    ("vd_kl_hpo_min_terms_for_full_weight", "train", None),
+    ("vd_kl_teacher_max_concepts", "train", None),
+    ("vd_kl_teacher_concept_temperature", "train", None),
+    ("vd_kl_prior_correction_alpha", "train", None),
+    ("vd_kl_concept_filter_level", "train", None),
+    ("vd_kl_min_concept_corr", "train", None),
+    ("vd_kl_disease_score_power", "train", None),
+    ("vd_kl_slack_tau", "train", None),
+]
+
+# 需要 bool() 转换的参数 (argparse type=int choices=[0,1] → config bool)
+_ARG_CFG_BOOL: List[Tuple[str, str, Optional[str]]] = [
+    ("main_logit_scale_learnable", "train", None),
+    ("aux_update_hgt", "train", None),
+    ("enrich_trait_graph", "model", None),
+    ("disease_size_embed", "model", None),
+    ("enable_vd_kl", "train", None),
+    ("vd_kl_adaptive_weight", "train", None),
+    ("vd_kl_gene_propagation", "train", None),
+    ("vd_kl_gene_propagation_adaptive_alpha", "train", None),
+    ("vd_kl_gene_propagation_exclude_d2v", "train", None),
+    ("vd_kl_gene_propagation_confidence_scaling", "train", None),
+    ("vd_kl_quality_row_weight", "train", None),
+    ("vd_kl_shuffle_teacher", "train", None),
+    ("vd_kl_raw_corr_mode", "train", None),
+    ("vd_kl_concept_quality_scaling", "train", None),
+    ("vd_kl_concept_specificity_weighting", "train", None),
+    ("enable_concept_regression", "train", None),
+]
+
+
+def _apply_args_to_config(args: argparse.Namespace, cfg) -> None:
+    for arg_name, section, field in _ARG_CFG_DIRECT:
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            setattr(getattr(cfg, section), field or arg_name, val)
+    for arg_name, section, field in _ARG_CFG_BOOL:
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            setattr(getattr(cfg, section), field or arg_name, bool(val))
 
 
 def canonicalize_task_mode(task_mode: str) -> str:
@@ -393,6 +554,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=str, default=None)
     p.add_argument("--export-predictions", type=int, default=1,
                    help="Export per-example predictions CSV after test eval (0=off, 1=on)")
+    p.add_argument("--eval-only", type=str, default=None,
+                   help="Skip training, load checkpoint (best_model.pt), run test eval only")
     p.add_argument("--main-labels", type=str, default=None)
     p.add_argument("--disease-table", type=str, default=None)
     p.add_argument("--batch-size-main", type=int, default=None)
@@ -471,6 +634,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--func-train-per-gene-cap", type=int, default=None)
     p.add_argument("--min-train-records-func", type=int, default=None)
     p.add_argument("--mvp-hpo-semantic-map", type=str, default=None)
+    p.add_argument("--mvp-disease-concept-map", type=str, default=None)
+    p.add_argument("--mvp-topk-indices", type=str, default=None,
+                    help="Override MVP top-K indices path (e.g. raw_corr_topk_indices_EUR_k256.npy)")
+    p.add_argument("--mvp-topk-values", type=str, default=None,
+                    help="Override MVP top-K values path (e.g. raw_corr_topk_values_EUR_k256.npy)")
+    p.add_argument("--mvp-topk-metadata", type=str, default=None,
+                    help="Override MVP top-K metadata path (e.g. raw_corr_topk_metadata_EUR_k256.json)")
+    p.add_argument("--vd-kl-max-diseases-per-concept", type=int, default=None)
+    p.add_argument("--vd-kl-concept-specificity-weighting", type=int, choices=[0, 1], default=None)
+    p.add_argument("--vd-kl-bridge-length-penalty-b", type=float, default=None)
+    p.add_argument("--vd-kl-hpo-min-terms-for-full-weight", type=int, default=None)
+    p.add_argument("--vd-kl-teacher-max-concepts", type=int, default=None,
+                   help="Only use top-K mapped concepts per variant (0=all)")
+    p.add_argument("--vd-kl-teacher-concept-temperature", type=float, default=None,
+                   help="Temperature for concept prob sharpening (<1=sharper, 1=no change)")
     p.add_argument("--modality-drop-variant", type=float, default=None)
     p.add_argument("--modality-drop-protein", type=float, default=None)
     p.add_argument("--modality-drop-gene", type=float, default=None)
@@ -497,6 +675,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--disease-freq-weight-clip", type=float, default=None)
     p.add_argument("--enable-vd-kl", type=int, choices=[0, 1], default=None)
     p.add_argument(
+        "--vd-kl-loss-type",
+        type=str,
+        choices=["kl", "set_infonce", "weighted_set_infonce", "slack_constraint"],
+        default=None,
+        help="kl: match teacher distribution (default); set_infonce: multi-positive InfoNCE over support set",
+    )
+    p.add_argument(
         "--vd-kl-teacher-mode",
         type=str,
         choices=["concept_map", "hpo_semantic", "hybrid"],
@@ -518,6 +703,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vd-kl-concept-semantic-weight", type=float, default=None)
     p.add_argument("--vd-kl-min-variant-mapped-mass", type=float, default=None)
     p.add_argument("--vd-kl-max-diseases-per-variant", type=int, default=None)
+    p.add_argument("--vd-kl-disease-score-concentration", type=float, default=None,
+                   help="Keep disease in support set only if score > C × uniform_baseline (0=disabled, 2.0=recommended)")
     p.add_argument("--vd-kl-max-variants-per-disease", type=int, default=None)
     p.add_argument("--vd-kl-positive-smoothing", type=float, default=None)
     p.add_argument("--vd-kl-d2v-positive-smoothing", type=float, default=None)
@@ -529,13 +716,50 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vd-kl-d2v-max-positive-variants", type=int, default=None)
     p.add_argument("--vd-kl-adaptive-weight", type=int, choices=[0, 1], default=None)
     p.add_argument("--vd-kl-adaptive-reference-scale", type=float, default=None)
-    p.add_argument("--vd-kl-concept-filter-level", type=int, choices=[0, 1, 2], default=0,
+    p.add_argument("--vd-kl-gene-propagation", type=int, choices=[0, 1], default=None,
+                    help="Propagate teacher signal to same-gene variants without direct MVP teacher")
+    p.add_argument("--vd-kl-gene-propagation-alpha", type=float, default=None,
+                    help="KL weight decay for gene-propagated variants (default 0.3)")
+    p.add_argument("--vd-kl-gene-propagation-distance-lambda", type=float, default=None,
+                    help="Distance decay for position-weighted propagation (default 0.01, 0=uniform)")
+    p.add_argument("--vd-kl-gene-propagation-max-distance", type=int, default=None,
+                    help="Max aa distance for propagation sources (default 0=unlimited)")
+    p.add_argument("--vd-kl-gene-propagation-adaptive-alpha", type=int, choices=[0, 1], default=None,
+                    help="Alpha decays with distance to nearest source (default 0)")
+    p.add_argument("--vd-kl-gene-propagation-exclude-d2v", type=int, choices=[0, 1], default=None,
+                    help="Exclude propagated variants from D2V reverse teacher (default 1)")
+    p.add_argument("--vd-kl-gene-propagation-entropy-threshold", type=float, default=None,
+                    help="Filter propagated variants with normalized entropy > threshold (default 0=disabled)")
+    p.add_argument("--vd-kl-gene-propagation-position-unknown-penalty", type=float, default=None,
+                    help="Weight multiplier when protein position cannot be parsed (default 0.3)")
+    p.add_argument("--vd-kl-gene-propagation-confidence-scaling", type=int, choices=[0, 1], default=None,
+                    help="Scale alpha by source-count confidence: 1-exp(-0.5*n) (default 0)")
+    p.add_argument("--vd-kl-quality-row-weight", type=int, choices=[0, 1], default=None,
+                    help="Use mapped_mass as row weight for direct-mapped variants (default 0=uniform 1.0)")
+    p.add_argument("--vd-kl-prior-correction-alpha", type=float, default=None,
+                    help="Prior-correct disease scores: q'_d ∝ q_d/π(d)^α; 0=disabled; >0 boosts rare diseases")
+    p.add_argument("--vd-kl-slack-tau", type=float, default=None,
+                    help="Target mass-on-support for slack_constraint loss (default 0.5)")
+    p.add_argument("--vd-kl-raw-corr-mode", type=int, choices=[0, 1], default=None,
+                    help="Raw correlation pipeline: skip concept temp/renorm, use |corr| threshold (default 0)")
+    p.add_argument("--vd-kl-min-concept-corr", type=float, default=None,
+                    help="Min |correlation| to include a concept (only in raw_corr_mode, default 0.01)")
+    p.add_argument("--vd-kl-disease-score-power", type=float, default=None,
+                    help="Power transform on disease_scores before normalization; >1 sharpens (default 1.0)")
+    p.add_argument("--vd-kl-concept-quality-scaling", type=int, choices=[0, 1], default=None,
+                    help="Scale per-concept weights by max(original_scores) to preserve sigmoid calibration (default 0)")
+    p.add_argument("--main-hard-negative-k", type=int, default=None,
+                    help="Hard negative mining: keep top-k hardest negatives per sample (0=disabled)")
+    p.add_argument("--vd-kl-concept-filter-level", type=int, choices=[0, 1, 2], default=None,
                     help="Teacher concept filter: 0=none, 1=remove PheCodes+exact disease names, 2=L1+fuzzy 70%%")
-    p.add_argument("--vd-kl-shuffle-teacher", type=int, choices=[0, 1], default=0,
+    p.add_argument("--vd-kl-shuffle-teacher", type=int, choices=[0, 1], default=None,
                     help="Shuffle teacher concept indices (negative control)")
     p.add_argument("--loss-weight-main", type=float, default=None)
     p.add_argument("--loss-weight-domain", type=float, default=None)
     p.add_argument("--loss-weight-func", type=float, default=None)
+    p.add_argument("--loss-weight-concept", type=float, default=None)
+    p.add_argument("--enable-concept-regression", type=int, choices=[0, 1], default=None,
+                    help="Enable gene-level concept profile regression (0=off, 1=on)")
     p.add_argument("--subsample-fraction", type=float, default=None,
                     help="Subsample training main-task labels (0.0-1.0) for label-efficiency experiments")
     p.add_argument("--num-graph-layers", type=int, default=None,
@@ -581,209 +805,8 @@ def main() -> None:
             val = getattr(cfg.paths, field_name)
             if isinstance(val, str) and val.startswith(old_prefix):
                 setattr(cfg.paths, field_name, val.replace(old_prefix, data_root + "/", 1))
-    if args.num_workers is not None:
-        cfg.runtime.num_workers = args.num_workers
-    split_only = False
-    if args.epochs is not None:
-        cfg.train.epochs = args.epochs
-    if args.device is not None:
-        cfg.runtime.device = args.device
-    if args.seed is not None:
-        cfg.split.seed = args.seed
-    if args.output_dir is not None:
-        cfg.paths.output_dir = args.output_dir
-    if args.main_labels is not None:
-        cfg.paths.main_labels = args.main_labels
-    if args.disease_table is not None:
-        cfg.paths.disease_table = args.disease_table
-    if args.batch_size_main is not None:
-        cfg.train.batch_size_main = args.batch_size_main
-    if args.batch_size_domain is not None:
-        cfg.train.batch_size_domain = args.batch_size_domain
-    if args.batch_size_func is not None:
-        cfg.train.batch_size_func = args.batch_size_func
-    if args.lr is not None:
-        cfg.train.lr = args.lr
-    if args.lr_graph is not None:
-        cfg.train.lr_graph = args.lr_graph
-    if args.lr_disease_encoder is not None:
-        cfg.train.lr_disease_encoder = args.lr_disease_encoder
-    if args.lr_graph_warmup is not None:
-        cfg.train.lr_graph_warmup = args.lr_graph_warmup
-    if args.graph_warmup_epochs is not None:
-        cfg.train.graph_warmup_epochs = args.graph_warmup_epochs
-    if args.graph_cache_refresh_steps is not None:
-        cfg.train.graph_cache_refresh_steps = args.graph_cache_refresh_steps
-    if args.weight_decay is not None:
-        cfg.train.weight_decay = args.weight_decay
-    if args.grad_clip_norm is not None:
-        cfg.train.grad_clip_norm = args.grad_clip_norm
-    if args.eval_interval is not None:
-        cfg.train.eval_interval = args.eval_interval
-    if args.early_stopping_patience is not None:
-        cfg.train.early_stopping_patience = args.early_stopping_patience
-    if args.main_temperature is not None:
-        cfg.train.main_temperature = args.main_temperature
-    if args.domain_temperature is not None:
-        cfg.train.domain_temperature = args.domain_temperature
-    if args.domain_loss_type is not None:
-        cfg.train.domain_loss_type = args.domain_loss_type
-    if args.domain_contrastive_negatives is not None:
-        cfg.train.domain_contrastive_negatives = args.domain_contrastive_negatives
-    if args.domain_data_mode is not None:
-        cfg.train.domain_data_mode = args.domain_data_mode
-    if args.domain_train_per_label_cap is not None:
-        cfg.train.domain_train_per_label_cap = args.domain_train_per_label_cap
-    if args.main_early_stop_metric is not None:
-        cfg.train.main_early_stop_metric = args.main_early_stop_metric
-    if args.main_loss_type is not None:
-        cfg.train.main_loss_type = args.main_loss_type
-    if args.main_logit_scale_learnable is not None:
-        cfg.train.main_logit_scale_learnable = bool(args.main_logit_scale_learnable)
-    if args.main_logit_scale_min is not None:
-        cfg.train.main_logit_scale_min = args.main_logit_scale_min
-    if args.main_logit_scale_max is not None:
-        cfg.train.main_logit_scale_max = args.main_logit_scale_max
-    if args.main_logit_scale_init is not None:
-        cfg.train.main_logit_scale_init = args.main_logit_scale_init
-    if args.main_logit_scale_lr_mult is not None:
-        cfg.train.main_logit_scale_lr_mult = args.main_logit_scale_lr_mult
-    if args.label_smoothing is not None:
-        cfg.train.label_smoothing = args.label_smoothing
-    if args.aux_update_hgt is not None:
-        cfg.train.aux_update_hgt = bool(args.aux_update_hgt)
-    if args.aux_domain_interval is not None:
-        cfg.train.aux_domain_interval = args.aux_domain_interval
-    if args.aux_func_interval is not None:
-        cfg.train.aux_func_interval = args.aux_func_interval
-    if args.main_only_warmup_epochs is not None:
-        cfg.train.main_only_warmup_epochs = args.main_only_warmup_epochs
-    if args.gate_entropy_weight_start is not None:
-        cfg.train.gate_entropy_weight_start = args.gate_entropy_weight_start
-    if args.gate_entropy_weight_end is not None:
-        cfg.train.gate_entropy_weight_end = args.gate_entropy_weight_end
-    if args.graph_visibility is not None:
-        cfg.train.graph_visibility = args.graph_visibility
-    if args.graph_train_mode is not None:
-        cfg.train.graph_train_mode = args.graph_train_mode
-    if args.graph_mode is not None:
-        cfg.model.graph_mode = args.graph_mode
-    if args.enrich_trait_graph is not None:
-        cfg.model.enrich_trait_graph = bool(args.enrich_trait_graph)
-    if args.residual_alpha_max is not None:
-        cfg.model.residual_alpha_max = args.residual_alpha_max
-    if args.split_protocol is not None:
-        cfg.split.protocol = args.split_protocol
-    if args.split_mode is not None:
-        cfg.split.mode = args.split_mode
-    if args.split_only is not None:
-        split_only = bool(args.split_only)
-    if args.split_artifact_path is not None:
-        cfg.paths.split_artifact_path = args.split_artifact_path
-    if args.func_min_valid_axes is not None:
-        cfg.train.func_min_valid_axes = args.func_min_valid_axes
-    if args.func_mechanism_pos_weight is not None:
-        cfg.train.func_mechanism_pos_weight = args.func_mechanism_pos_weight
-    if args.func_train_per_gene_cap is not None:
-        cfg.train.func_train_per_gene_cap = args.func_train_per_gene_cap
-    if args.min_train_records_func is not None:
-        cfg.train.min_train_records_func = args.min_train_records_func
-    if args.mvp_hpo_semantic_map is not None:
-        cfg.paths.mvp_hpo_semantic_map = args.mvp_hpo_semantic_map
-    if args.modality_drop_variant is not None:
-        cfg.model.modality_drop_variant = args.modality_drop_variant
-    if args.modality_drop_protein is not None:
-        cfg.model.modality_drop_protein = args.modality_drop_protein
-    if args.modality_drop_gene is not None:
-        cfg.model.modality_drop_gene = args.modality_drop_gene
-    if args.trait_dropout is not None:
-        cfg.model.trait_dropout = args.trait_dropout
-    if args.disease_size_embed is not None:
-        cfg.model.disease_size_embed = bool(args.disease_size_embed)
-    if args.fusion_type is not None:
-        cfg.model.fusion_type = args.fusion_type
-    if args.disease_freq_reweight is not None:
-        cfg.train.disease_freq_reweight = args.disease_freq_reweight
-    if args.disease_freq_weight_agg is not None:
-        cfg.train.disease_freq_weight_agg = args.disease_freq_weight_agg
-    if args.disease_freq_weight_clip is not None:
-        cfg.train.disease_freq_weight_clip = args.disease_freq_weight_clip
-    if args.enable_vd_kl is not None:
-        cfg.train.enable_vd_kl = bool(args.enable_vd_kl)
-    if args.vd_kl_teacher_mode is not None:
-        cfg.train.vd_kl_teacher_mode = args.vd_kl_teacher_mode
-    if args.vd_kl_lambda_v2d is not None:
-        cfg.train.vd_kl_lambda_v2d = args.vd_kl_lambda_v2d
-    if args.vd_kl_lambda_d2v is not None:
-        cfg.train.vd_kl_lambda_d2v = args.vd_kl_lambda_d2v
-    if args.vd_kl_lambda_v2d_start is not None:
-        cfg.train.vd_kl_lambda_v2d_start = args.vd_kl_lambda_v2d_start
-    if args.vd_kl_lambda_d2v_start is not None:
-        cfg.train.vd_kl_lambda_d2v_start = args.vd_kl_lambda_d2v_start
-    if args.vd_kl_lambda_ramp_epochs is not None:
-        cfg.train.vd_kl_lambda_ramp_epochs = args.vd_kl_lambda_ramp_epochs
-    if args.vd_kl_temperature is not None:
-        cfg.train.vd_kl_temperature = args.vd_kl_temperature
-    if args.vd_kl_warmup_epochs is not None:
-        cfg.train.vd_kl_warmup_epochs = args.vd_kl_warmup_epochs
-    if args.vd_kl_d2v_start_epoch is not None:
-        cfg.train.vd_kl_d2v_start_epoch = args.vd_kl_d2v_start_epoch
-    if args.vd_kl_cache_refresh_interval is not None:
-        cfg.train.vd_kl_cache_refresh_interval = args.vd_kl_cache_refresh_interval
-    if args.vd_kl_d2v_batch_size is not None:
-        cfg.train.vd_kl_d2v_batch_size = args.vd_kl_d2v_batch_size
-    if args.vd_kl_hpo_topk_per_hpo is not None:
-        cfg.train.vd_kl_hpo_topk_per_hpo = args.vd_kl_hpo_topk_per_hpo
-    if args.vd_kl_hpo_min_similarity is not None:
-        cfg.train.vd_kl_hpo_min_similarity = args.vd_kl_hpo_min_similarity
-    if args.vd_kl_concept_direct_weight is not None:
-        cfg.train.vd_kl_concept_direct_weight = args.vd_kl_concept_direct_weight
-    if args.vd_kl_concept_semantic_weight is not None:
-        cfg.train.vd_kl_concept_semantic_weight = args.vd_kl_concept_semantic_weight
-    if args.vd_kl_min_variant_mapped_mass is not None:
-        cfg.train.vd_kl_min_variant_mapped_mass = args.vd_kl_min_variant_mapped_mass
-    if args.vd_kl_max_diseases_per_variant is not None:
-        cfg.train.vd_kl_max_diseases_per_variant = args.vd_kl_max_diseases_per_variant
-    if args.vd_kl_max_variants_per_disease is not None:
-        cfg.train.vd_kl_max_variants_per_disease = args.vd_kl_max_variants_per_disease
-    if args.vd_kl_positive_smoothing is not None:
-        cfg.train.vd_kl_positive_smoothing = args.vd_kl_positive_smoothing
-    if args.vd_kl_d2v_positive_smoothing is not None:
-        cfg.train.vd_kl_d2v_positive_smoothing = args.vd_kl_d2v_positive_smoothing
-    if args.vd_kl_d2v_min_anchor_mass is not None:
-        cfg.train.vd_kl_d2v_min_anchor_mass = args.vd_kl_d2v_min_anchor_mass
-    if args.vd_kl_d2v_min_rows_per_step is not None:
-        cfg.train.vd_kl_d2v_min_rows_per_step = args.vd_kl_d2v_min_rows_per_step
-    if args.vd_kl_min_teacher_top1_prob is not None:
-        cfg.train.vd_kl_min_teacher_top1_prob = args.vd_kl_min_teacher_top1_prob
-    if args.vd_kl_d2v_teacher_topk is not None:
-        cfg.train.vd_kl_d2v_teacher_topk = args.vd_kl_d2v_teacher_topk
-    if args.vd_kl_d2v_random_negatives is not None:
-        cfg.train.vd_kl_d2v_random_negatives = args.vd_kl_d2v_random_negatives
-    if args.vd_kl_d2v_max_positive_variants is not None:
-        cfg.train.vd_kl_d2v_max_positive_variants = args.vd_kl_d2v_max_positive_variants
-    if args.vd_kl_adaptive_weight is not None:
-        cfg.train.vd_kl_adaptive_weight = bool(args.vd_kl_adaptive_weight)
-    if args.vd_kl_adaptive_reference_scale is not None:
-        cfg.train.vd_kl_adaptive_reference_scale = args.vd_kl_adaptive_reference_scale
-    if args.loss_weight_main is not None:
-        cfg.loss_weights.main = args.loss_weight_main
-    if args.loss_weight_domain is not None:
-        cfg.loss_weights.domain = args.loss_weight_domain
-    if args.loss_weight_func is not None:
-        cfg.loss_weights.func = args.loss_weight_func
-    if args.num_graph_layers is not None:
-        cfg.model.num_graph_layers = args.num_graph_layers
-    if args.hidden_dim is not None:
-        cfg.model.hidden_dim = args.hidden_dim
-    if args.out_dim is not None:
-        cfg.model.out_dim = args.out_dim
-    if args.scheduler_t0 is not None:
-        cfg.train.scheduler_t0 = args.scheduler_t0
-    if args.scheduler_t_mult is not None:
-        cfg.train.scheduler_t_mult = args.scheduler_t_mult
-    if args.scheduler_eta_min is not None:
-        cfg.train.scheduler_eta_min = args.scheduler_eta_min
+    _apply_args_to_config(args, cfg)
+    split_only = bool(args.split_only) if args.split_only is not None else False
 
     disease_encoder_type = args.disease_encoder_type or "hpo_attention"
 
@@ -828,6 +851,18 @@ def main() -> None:
         raise ValueError("vd_kl_cache_refresh_interval must be > 0")
     if cfg.train.vd_kl_d2v_batch_size <= 0:
         raise ValueError("vd_kl_d2v_batch_size must be > 0")
+    if cfg.train.vd_kl_loss_type not in {"kl", "set_infonce", "weighted_set_infonce", "slack_constraint"}:
+        raise ValueError(f"Unknown vd_kl_loss_type: {cfg.train.vd_kl_loss_type}")
+    if cfg.train.vd_kl_slack_tau <= 0 or cfg.train.vd_kl_slack_tau >= 1:
+        raise ValueError(f"vd_kl_slack_tau must be in (0, 1), got {cfg.train.vd_kl_slack_tau}")
+    # --- set_infonce / weighted_set_infonce: 不再强制覆盖 max_diseases_per_variant ---
+    # 旧逻辑把 max_diseases_per_variant 强制设为 0（无截断），导致 |S|≈700，
+    # gradient vanishing。现在保留用户设置（默认 32），允许公平对比。
+    if cfg.train.enable_vd_kl and cfg.train.vd_kl_loss_type in ("set_infonce", "weighted_set_infonce"):
+        if cfg.train.vd_kl_teacher_mode != "concept_map" and cfg.train.vd_kl_max_diseases_per_variant == 0:
+            print(f"[{cfg.train.vd_kl_loss_type}] WARNING: teacher_mode={cfg.train.vd_kl_teacher_mode} "
+                  f"+ max_diseases_per_variant=0 → |S|≈700 (44% of diseases)。"
+                  f"建议设置 --vd-kl-max-diseases-per-variant 32 或使用 --vd-kl-teacher-mode concept_map。")
     if cfg.train.vd_kl_teacher_mode not in {"concept_map", "hpo_semantic", "hybrid"}:
         raise ValueError(f"Unknown vd_kl_teacher_mode: {cfg.train.vd_kl_teacher_mode}")
     if cfg.train.vd_kl_hpo_topk_per_hpo <= 0:
@@ -882,7 +917,7 @@ def main() -> None:
     elif cfg.model.graph_mode == "none" and cfg.train.graph_train_mode == "full":
         print(f"graph_mode=none → capping graph_train_mode to weak (was full)")
         cfg.train.graph_train_mode = "weak"
-    cfg.train.use_inductive_graph_train = cfg.train.graph_visibility == "inductive"
+    _use_inductive_graph_train = cfg.train.graph_visibility == "inductive"
     set_seed(cfg.split.seed)
     out_dir = ensure_output_dir(cfg)
     device = torch.device(cfg.runtime.device)
@@ -899,7 +934,7 @@ def main() -> None:
         f"domain_cap={cfg.train.domain_train_per_label_cap} "
         f"main_warmup={cfg.train.main_only_warmup_epochs} "
         f"freq_reweight={cfg.train.disease_freq_reweight}:{cfg.train.disease_freq_weight_agg}:{cfg.train.disease_freq_weight_clip} "
-        f"vd_kl={cfg.train.enable_vd_kl} vd_teacher={cfg.train.vd_kl_teacher_mode}"
+        f"vd_kl={cfg.train.enable_vd_kl} vd_loss_type={cfg.train.vd_kl_loss_type} vd_teacher={cfg.train.vd_kl_teacher_mode}"
     )
     print(f"device={device}")
 
@@ -1183,7 +1218,7 @@ def main() -> None:
         gene_mapping=mappings["gene_to_idx"],
         trait_mapping=mappings["trait_to_idx"],
     )
-    if cfg.train.use_inductive_graph_train:
+    if _use_inductive_graph_train:
         train_gene_indices = {
             mappings["gene_to_idx"][g]
             for g, split_name in gene_split_map.items()
@@ -1439,7 +1474,7 @@ def main() -> None:
         # Collect disease names for concept filtering (read from raw CSV since
         # load_disease_table() only keeps disease_index + hpo_ids)
         _disease_names_for_filter: Optional[List[str]] = None
-        if args.vd_kl_concept_filter_level > 0:
+        if cfg.train.vd_kl_concept_filter_level > 0:
             try:
                 _raw_disease_csv = pd.read_csv(cfg.paths.disease_table, usecols=["representative_name"])
                 _disease_names_for_filter = _raw_disease_csv["representative_name"].dropna().tolist()
@@ -1449,6 +1484,17 @@ def main() -> None:
         _concept_meta_path = str(
             Path(cfg.paths.mvp_disease_concept_map).resolve().parent / "concept_to_disease_mapping.json"
         )
+        # Compute disease frequency from training data for prior correction
+        _train_disease_freq: Optional[Dict[int, int]] = None
+        if cfg.train.vd_kl_prior_correction_alpha > 0:
+            from collections import Counter
+            _disease_counter: Counter = Counter()
+            for rec in records["train"]["main"]:
+                for did in rec.get("positive_disease_ids", []):
+                    _disease_counter[int(did)] += 1
+            _train_disease_freq = dict(_disease_counter)
+            print(f"prior_correction: alpha={cfg.train.vd_kl_prior_correction_alpha}, "
+                  f"n_diseases_in_train={len(_train_disease_freq)}")
         vd_kl_teacher = build_variant_disease_kl_teacher(
             train_main_records=records["train"]["main"],
             idx_to_variant=feature_store.idx_to_variant,
@@ -1468,11 +1514,34 @@ def main() -> None:
             min_variant_mapped_mass=cfg.train.vd_kl_min_variant_mapped_mass,
             max_diseases_per_variant=cfg.train.vd_kl_max_diseases_per_variant,
             max_variants_per_disease=cfg.train.vd_kl_max_variants_per_disease,
-            concept_filter_level=args.vd_kl_concept_filter_level,
+            concept_filter_level=cfg.train.vd_kl_concept_filter_level,
             concept_metadata_path=_concept_meta_path,
             disease_names=_disease_names_for_filter,
-            shuffle_teacher=bool(args.vd_kl_shuffle_teacher),
+            shuffle_teacher=bool(cfg.train.vd_kl_shuffle_teacher),
             shuffle_seed=args.seed if args.seed else 42,
+            gene_propagation=cfg.train.vd_kl_gene_propagation,
+            gene_propagation_alpha=cfg.train.vd_kl_gene_propagation_alpha,
+            gene_propagation_distance_lambda=cfg.train.vd_kl_gene_propagation_distance_lambda,
+            gene_propagation_max_distance=cfg.train.vd_kl_gene_propagation_max_distance,
+            gene_propagation_adaptive_alpha=cfg.train.vd_kl_gene_propagation_adaptive_alpha,
+            gene_propagation_exclude_d2v=cfg.train.vd_kl_gene_propagation_exclude_d2v,
+            gene_propagation_entropy_threshold=cfg.train.vd_kl_gene_propagation_entropy_threshold,
+            gene_propagation_position_unknown_penalty=cfg.train.vd_kl_gene_propagation_position_unknown_penalty,
+            gene_propagation_confidence_scaling=cfg.train.vd_kl_gene_propagation_confidence_scaling,
+            max_diseases_per_concept=cfg.train.vd_kl_max_diseases_per_concept,
+            concept_specificity_weighting=cfg.train.vd_kl_concept_specificity_weighting,
+            bridge_length_penalty_b=cfg.train.vd_kl_bridge_length_penalty_b,
+            hpo_min_terms_for_full_weight=cfg.train.vd_kl_hpo_min_terms_for_full_weight,
+            teacher_max_concepts=cfg.train.vd_kl_teacher_max_concepts,
+            teacher_concept_temperature=cfg.train.vd_kl_teacher_concept_temperature,
+            disease_score_concentration=cfg.train.vd_kl_disease_score_concentration,
+            quality_row_weight=cfg.train.vd_kl_quality_row_weight,
+            prior_correction_alpha=cfg.train.vd_kl_prior_correction_alpha,
+            train_disease_freq=_train_disease_freq,
+            raw_corr_mode=cfg.train.vd_kl_raw_corr_mode,
+            min_concept_corr=cfg.train.vd_kl_min_concept_corr,
+            disease_score_power=cfg.train.vd_kl_disease_score_power,
+            concept_quality_scaling=cfg.train.vd_kl_concept_quality_scaling,
         )
         print("vd_kl_teacher_stats=" + json.dumps(vd_kl_teacher.stats, ensure_ascii=False))
         if int(vd_kl_teacher.stats.get("mapped_variants", 0.0)) <= 0:
@@ -1516,8 +1585,7 @@ def main() -> None:
         )
 
     if subsample_fraction is not None and 0.0 < subsample_fraction < 1.0:
-        import random as _rng_mod
-        _sub_rng = _rng_mod.Random(int(cfg.split.seed))
+        _sub_rng = random.Random(int(cfg.split.seed))
         orig_n = len(records["train"]["main"])
         keep_n = max(1, int(orig_n * subsample_fraction))
         records["train"]["main"] = _sub_rng.sample(records["train"]["main"], keep_n)
@@ -1631,6 +1699,29 @@ def main() -> None:
     else:
         domain_embeddings = torch.empty((0, cfg.model.domain_embedding_dim), dtype=torch.float32)
 
+    # 加载 gene-level concept SVD targets
+    concept_targets_t: Optional[torch.Tensor] = None
+    gene_to_concept_row: Optional[Dict[str, int]] = None
+    concept_svd_dim_actual = 0
+    if cfg.train.enable_concept_regression:
+        svd_path = cfg.paths.gene_concept_svd
+        svd_meta_path = cfg.paths.gene_concept_svd_metadata
+        if Path(svd_path).exists() and Path(svd_meta_path).exists():
+            concept_emb_np, gene_to_concept_row = load_gene_concept_targets(
+                svd_path, svd_meta_path,
+            )
+            concept_targets_t = torch.tensor(concept_emb_np, dtype=torch.float32)
+            concept_svd_dim_actual = concept_emb_np.shape[1]
+            # 统计覆盖率
+            covered = sum(1 for g in mappings["gene_to_idx"] if g.upper() in gene_to_concept_row)
+            total_genes = len(mappings["gene_to_idx"])
+            print(f"concept_regression: loaded {concept_emb_np.shape[0]} gene targets, "
+                  f"dim={concept_svd_dim_actual}, "
+                  f"coverage={covered}/{total_genes} ({100*covered/max(total_genes,1):.1f}%)")
+        else:
+            print(f"concept_regression: SVD files not found ({svd_path}), disabling")
+            cfg.train.enable_concept_regression = False
+
     print("[6/8] init model")
     set_seed(cfg.split.seed)
     model = MultiTaskModel(
@@ -1663,6 +1754,7 @@ def main() -> None:
         num_diseases=len(all_disease_ids) if disease_encoder_type == "disease_id" else 0,
         graph_mode=cfg.model.graph_mode,
         residual_alpha_max=cfg.model.residual_alpha_max,
+        concept_svd_dim=concept_svd_dim_actual if cfg.train.enable_concept_regression else 0,
     ).to(device)
     print(
         f"fusion_type={cfg.model.fusion_type} "
@@ -1675,6 +1767,10 @@ def main() -> None:
     variant_x_t = feature_store.variant_x
     protein_x_t = feature_store.protein_x
     train_result: Dict[str, object]
+
+    _eval_only_ckpt = args.eval_only
+    if _eval_only_ckpt:
+        cfg.train.epochs = 0  # skip training loop, just build infrastructure
 
     print("[7/8] training")
     configure_trainable_modules(
@@ -1713,6 +1809,7 @@ def main() -> None:
             "func_protein_impact": cfg.loss_weights.func * 0.30,
             "func_integrative": cfg.loss_weights.func * 0.25,
             "func_mechanism": cfg.loss_weights.func * 0.15,
+            "concept": cfg.loss_weights.concept,
         },
         epochs=cfg.train.epochs,
         grad_clip_norm=cfg.train.grad_clip_norm,
@@ -1745,6 +1842,7 @@ def main() -> None:
         val_heldout_disease_ids=val_heldout_disease_ids if val_heldout_disease_ids else None,
         vd_kl_teacher=vd_kl_teacher,
         enable_vd_kl=(cfg.train.enable_vd_kl and vd_kl_teacher is not None),
+        vd_kl_loss_type=cfg.train.vd_kl_loss_type,
         vd_kl_lambda_v2d=cfg.train.vd_kl_lambda_v2d,
         vd_kl_lambda_d2v=cfg.train.vd_kl_lambda_d2v,
         vd_kl_lambda_v2d_start=cfg.train.vd_kl_lambda_v2d_start,
@@ -1765,11 +1863,17 @@ def main() -> None:
         vd_kl_d2v_max_positive_variants=cfg.train.vd_kl_d2v_max_positive_variants,
         vd_kl_adaptive_weight=cfg.train.vd_kl_adaptive_weight,
         vd_kl_adaptive_reference_scale=cfg.train.vd_kl_adaptive_reference_scale,
+        vd_kl_slack_tau=cfg.train.vd_kl_slack_tau,
         label_smoothing=cfg.train.label_smoothing,
         graph_warmup_epochs=cfg.train.graph_warmup_epochs,
         graph_warmup_lr=cfg.train.lr_graph_warmup,
         graph_cache_refresh_steps=cfg.train.graph_cache_refresh_steps,
         eval_interval=cfg.train.eval_interval,
+        main_hard_negative_k=cfg.train.main_hard_negative_k,
+        concept_targets=concept_targets_t,
+        gene_to_concept_row=gene_to_concept_row,
+        idx_to_gene=mappings.get("idx_to_gene"),
+        enable_concept_regression=cfg.train.enable_concept_regression,
     )
 
     best_gate_temperature = float(train_result.get("best_gate_temperature", 1.0))
@@ -1786,6 +1890,17 @@ def main() -> None:
     )
     with open(out_dir / "train_result.json", "w", encoding="utf-8") as f:
         json.dump(train_result, f, ensure_ascii=False, indent=2)
+
+    # --- eval-only: load checkpoint, override model weights ---
+    if _eval_only_ckpt:
+        _ckpt_path = Path(_eval_only_ckpt)
+        if not _ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {_ckpt_path}")
+        print(f"[eval-only] loading {_ckpt_path}")
+        _ckpt = torch.load(_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(_ckpt["model_state_dict"])
+        best_gate_temperature = float(_ckpt.get("best_gate_temperature", 1.0))
+        print(f"  epoch={_ckpt.get('epoch', '?')} val_metric={_ckpt.get('best_metric', 0):.4f} gate_temp={best_gate_temperature:.4f}")
 
     print("[8/8] test eval")
     eval_graph = graph.to(device)
@@ -1838,7 +1953,6 @@ def main() -> None:
         full_main = test_metrics.get("main", {})
         test_metrics["main_variant_delta"] = _build_main_metric_delta(full_main, main_gene_only)
 
-        train_seen_disease_set = set(train_seen_diseases)
         test_diseases = set(main_test["disease_index"].astype(int).tolist())
         heldout_diseases = sorted(test_diseases - train_seen_disease_set)
         main_disease_heldout = evaluate_main(
@@ -1911,6 +2025,7 @@ def main() -> None:
         "graph_mode": cfg.model.graph_mode,
         "split_input_signature": split_input_signature,
         "enable_vd_kl": bool(cfg.train.enable_vd_kl and vd_kl_teacher is not None),
+        "vd_kl_loss_type": cfg.train.vd_kl_loss_type,
         "vd_kl_teacher_mode": cfg.train.vd_kl_teacher_mode,
         "vd_kl_lambda_v2d": float(cfg.train.vd_kl_lambda_v2d),
         "vd_kl_lambda_d2v": float(cfg.train.vd_kl_lambda_d2v),
@@ -1937,6 +2052,20 @@ def main() -> None:
         "vd_kl_d2v_teacher_topk": int(cfg.train.vd_kl_d2v_teacher_topk),
         "vd_kl_d2v_random_negatives": int(cfg.train.vd_kl_d2v_random_negatives),
         "vd_kl_d2v_max_positive_variants": int(cfg.train.vd_kl_d2v_max_positive_variants),
+        "vd_kl_gene_propagation": bool(cfg.train.vd_kl_gene_propagation),
+        "vd_kl_gene_propagation_alpha": float(cfg.train.vd_kl_gene_propagation_alpha),
+        "vd_kl_gene_propagation_distance_lambda": float(cfg.train.vd_kl_gene_propagation_distance_lambda),
+        "vd_kl_gene_propagation_max_distance": int(cfg.train.vd_kl_gene_propagation_max_distance),
+        "vd_kl_gene_propagation_adaptive_alpha": bool(cfg.train.vd_kl_gene_propagation_adaptive_alpha),
+        "vd_kl_gene_propagation_exclude_d2v": bool(cfg.train.vd_kl_gene_propagation_exclude_d2v),
+        "vd_kl_gene_propagation_entropy_threshold": float(cfg.train.vd_kl_gene_propagation_entropy_threshold),
+        "vd_kl_gene_propagation_position_unknown_penalty": float(cfg.train.vd_kl_gene_propagation_position_unknown_penalty),
+        "vd_kl_gene_propagation_confidence_scaling": bool(cfg.train.vd_kl_gene_propagation_confidence_scaling),
+        "main_hard_negative_k": int(cfg.train.main_hard_negative_k),
+        "vd_kl_bridge_length_penalty_b": float(cfg.train.vd_kl_bridge_length_penalty_b),
+        "vd_kl_hpo_min_terms_for_full_weight": int(cfg.train.vd_kl_hpo_min_terms_for_full_weight),
+        "vd_kl_teacher_max_concepts": int(cfg.train.vd_kl_teacher_max_concepts),
+        "vd_kl_teacher_concept_temperature": float(cfg.train.vd_kl_teacher_concept_temperature),
         "main_only_warmup_epochs": int(cfg.train.main_only_warmup_epochs),
         "seed": cfg.split.seed,
         "enabled_tasks": sorted(enabled_tasks),
@@ -1999,8 +2128,19 @@ def main() -> None:
         "loss_weight_main": float(cfg.loss_weights.main),
         "loss_weight_domain": float(cfg.loss_weights.domain),
         "loss_weight_func": float(cfg.loss_weights.func),
+        "loss_weight_concept": float(cfg.loss_weights.concept),
+        "enable_concept_regression": bool(cfg.train.enable_concept_regression),
         "vd_kl_adaptive_weight": bool(cfg.train.vd_kl_adaptive_weight),
         "vd_kl_adaptive_reference_scale": float(cfg.train.vd_kl_adaptive_reference_scale),
+        "vd_kl_quality_row_weight": bool(cfg.train.vd_kl_quality_row_weight),
+        "vd_kl_prior_correction_alpha": float(cfg.train.vd_kl_prior_correction_alpha),
+        "vd_kl_slack_tau": float(cfg.train.vd_kl_slack_tau),
+        "vd_kl_raw_corr_mode": bool(cfg.train.vd_kl_raw_corr_mode),
+        "vd_kl_min_concept_corr": float(cfg.train.vd_kl_min_concept_corr),
+        "vd_kl_disease_score_power": float(cfg.train.vd_kl_disease_score_power),
+        "vd_kl_concept_quality_scaling": bool(cfg.train.vd_kl_concept_quality_scaling),
+        "vd_kl_concept_filter_level": int(cfg.train.vd_kl_concept_filter_level),
+        "vd_kl_shuffle_teacher": bool(cfg.train.vd_kl_shuffle_teacher),
         "main_temperature": float(cfg.train.main_temperature),
         "domain_loss_type": cfg.train.domain_loss_type,
         "domain_contrastive_negatives": int(cfg.train.domain_contrastive_negatives),

@@ -16,6 +16,33 @@ else:
     _PYG_IMPORT_ERROR = None
 
 
+def _apply_modality_dropout(
+    variant_emb: torch.Tensor,
+    protein_emb: torch.Tensor,
+    gene_emb: torch.Tensor,
+    training: bool,
+    drop_variant: float,
+    drop_protein: float,
+    drop_gene: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not training:
+        return variant_emb, protein_emb, gene_emb
+    bsz = variant_emb.shape[0]
+    mv = torch.ones(bsz, 1, device=variant_emb.device)
+    mp = torch.ones(bsz, 1, device=variant_emb.device)
+    mg = torch.ones(bsz, 1, device=variant_emb.device)
+    if drop_variant > 0:
+        mv = torch.bernoulli(mv * (1.0 - drop_variant))
+    if drop_protein > 0:
+        mp = torch.bernoulli(mp * (1.0 - drop_protein))
+    if drop_gene > 0:
+        mg = torch.bernoulli(mg * (1.0 - drop_gene))
+    all_zero = (mv + mp + mg) == 0
+    if all_zero.any():
+        mv[all_zero] = 1.0
+    return variant_emb * mv, protein_emb * mp, gene_emb * mg
+
+
 class MLPEncoder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> None:
         super().__init__()
@@ -182,26 +209,10 @@ class TrilinearFusion(nn.Module):
         gate_temperature: float = 1.0,
         return_gate_weights: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        if self.training:
-            bsz = variant_emb.shape[0]
-            mv = torch.ones(bsz, 1, device=variant_emb.device)
-            mp = torch.ones(bsz, 1, device=variant_emb.device)
-            mg = torch.ones(bsz, 1, device=variant_emb.device)
-
-            if self.modality_drop_variant > 0:
-                mv = torch.bernoulli(mv * (1.0 - self.modality_drop_variant))
-            if self.modality_drop_protein > 0:
-                mp = torch.bernoulli(mp * (1.0 - self.modality_drop_protein))
-            if self.modality_drop_gene > 0:
-                mg = torch.bernoulli(mg * (1.0 - self.modality_drop_gene))
-
-            all_zero = (mv + mp + mg) == 0
-            if all_zero.any():
-                mv[all_zero] = 1.0
-
-            variant_emb = variant_emb * mv
-            protein_emb = protein_emb * mp
-            gene_emb = gene_emb * mg
+        variant_emb, protein_emb, gene_emb = _apply_modality_dropout(
+            variant_emb, protein_emb, gene_emb, self.training,
+            self.modality_drop_variant, self.modality_drop_protein, self.modality_drop_gene,
+        )
 
         v = self.variant_norm(self.variant_proj(variant_emb))
         p = self.protein_norm(self.protein_proj(protein_emb))
@@ -238,29 +249,6 @@ class ConcatFusion(nn.Module):
         self.modality_drop_protein = modality_drop_protein
         self.modality_drop_gene = modality_drop_gene
 
-    def _apply_modality_dropout(
-        self,
-        variant_emb: torch.Tensor,
-        protein_emb: torch.Tensor,
-        gene_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not self.training:
-            return variant_emb, protein_emb, gene_emb
-        bsz = variant_emb.shape[0]
-        mv = torch.ones(bsz, 1, device=variant_emb.device)
-        mp = torch.ones(bsz, 1, device=variant_emb.device)
-        mg = torch.ones(bsz, 1, device=variant_emb.device)
-        if self.modality_drop_variant > 0:
-            mv = torch.bernoulli(mv * (1.0 - self.modality_drop_variant))
-        if self.modality_drop_protein > 0:
-            mp = torch.bernoulli(mp * (1.0 - self.modality_drop_protein))
-        if self.modality_drop_gene > 0:
-            mg = torch.bernoulli(mg * (1.0 - self.modality_drop_gene))
-        all_zero = (mv + mp + mg) == 0
-        if all_zero.any():
-            mv[all_zero] = 1.0
-        return variant_emb * mv, protein_emb * mp, gene_emb * mg
-
     def forward(
         self,
         variant_emb: torch.Tensor,
@@ -269,7 +257,10 @@ class ConcatFusion(nn.Module):
         gate_temperature: float = 1.0,
         return_gate_weights: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        v, p, g = self._apply_modality_dropout(variant_emb, protein_emb, gene_emb)
+        v, p, g = _apply_modality_dropout(
+            variant_emb, protein_emb, gene_emb, self.training,
+            self.modality_drop_variant, self.modality_drop_protein, self.modality_drop_gene,
+        )
         fused = self.mlp(torch.cat([v, p, g], dim=-1))
         if return_gate_weights:
             uniform = torch.full((variant_emb.shape[0], 3), 1.0 / 3, device=variant_emb.device)
@@ -306,29 +297,6 @@ class ConcatResidualFusion(nn.Module):
         self.modality_drop_protein = modality_drop_protein
         self.modality_drop_gene = modality_drop_gene
 
-    def _apply_modality_dropout(
-        self,
-        variant_emb: torch.Tensor,
-        protein_emb: torch.Tensor,
-        gene_emb: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not self.training:
-            return variant_emb, protein_emb, gene_emb
-        bsz = variant_emb.shape[0]
-        mv = torch.ones(bsz, 1, device=variant_emb.device)
-        mp = torch.ones(bsz, 1, device=variant_emb.device)
-        mg = torch.ones(bsz, 1, device=variant_emb.device)
-        if self.modality_drop_variant > 0:
-            mv = torch.bernoulli(mv * (1.0 - self.modality_drop_variant))
-        if self.modality_drop_protein > 0:
-            mp = torch.bernoulli(mp * (1.0 - self.modality_drop_protein))
-        if self.modality_drop_gene > 0:
-            mg = torch.bernoulli(mg * (1.0 - self.modality_drop_gene))
-        all_zero = (mv + mp + mg) == 0
-        if all_zero.any():
-            mv[all_zero] = 1.0
-        return variant_emb * mv, protein_emb * mp, gene_emb * mg
-
     def forward(
         self,
         variant_emb: torch.Tensor,
@@ -337,9 +305,11 @@ class ConcatResidualFusion(nn.Module):
         gate_temperature: float = 1.0,
         return_gate_weights: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        # Save variant_emb BEFORE modality dropout for residual path
         variant_raw = variant_emb
-        v, p, g = self._apply_modality_dropout(variant_emb, protein_emb, gene_emb)
+        v, p, g = _apply_modality_dropout(
+            variant_emb, protein_emb, gene_emb, self.training,
+            self.modality_drop_variant, self.modality_drop_protein, self.modality_drop_gene,
+        )
         fused = self.mlp(torch.cat([v, p, g], dim=-1))
         alpha = torch.sigmoid(self.residual_alpha)
         alpha = alpha * self.residual_alpha_max
@@ -525,6 +495,7 @@ class MultiTaskModel(nn.Module):
         num_diseases: int = 0,
         graph_mode: str = "hgt",
         residual_alpha_max: float = 1.0,
+        concept_svd_dim: int = 0,
     ) -> None:
         super().__init__()
         self.graph_mode = graph_mode
@@ -625,6 +596,18 @@ class MultiTaskModel(nn.Module):
         self.func_protein_impact_head = _func_axis_head(func_protein_impact_dim)
         self.func_integrative_head = _func_axis_head(func_integrative_dim)
         self.func_mechanism_head = _func_axis_head(func_mechanism_dim) if func_mechanism_dim > 0 else None
+
+        # Gene-level concept profile regression head
+        self.concept_svd_dim = concept_svd_dim
+        if concept_svd_dim > 0:
+            self.concept_regression_head = nn.Sequential(
+                nn.Linear(out_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, concept_svd_dim),
+            )
+        else:
+            self.concept_regression_head = None
 
     def forward_graph(
         self,
@@ -773,3 +756,20 @@ class MultiTaskModel(nn.Module):
         if return_gate_weights:
             return preds, gate_weights
         return preds
+
+    def forward_concept(
+        self,
+        gene_ids: torch.Tensor,
+        gene_graph_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """从 gene graph embedding 预测 gene concept SVD target。
+
+        Args:
+            gene_ids: [B] gene 索引
+            gene_graph_emb: [N_genes, out_dim] 全图 gene embeddings
+
+        Returns:
+            pred: [B, concept_svd_dim] 预测值
+        """
+        g = gene_graph_emb.index_select(0, gene_ids)
+        return self.concept_regression_head(g)

@@ -193,13 +193,6 @@ def _tie_aware_best_positive_metrics(
     return rr, recall_probs
 
 
-def _safe_spearman(x: torch.Tensor, y: torch.Tensor) -> float | None:
-    if x.numel() == 0 or y.numel() == 0 or x.numel() != y.numel():
-        return None
-    rx = _rankdata(x.to(torch.float32))
-    ry = _rankdata(y.to(torch.float32))
-    return _safe_pearson(rx, ry)
-
 
 def _mean_or_zero(values: List[float]) -> float:
     if not values:
@@ -277,32 +270,6 @@ def _compute_domain_metrics_from_logits(
 def _metric_bucket_token(label: str) -> str:
     return str(label).replace("-", "_").replace("+", "_plus")
 
-
-def _ndcg_at_k_binary(scores: torch.Tensor, labels01: torch.Tensor, k: int = 10) -> float:
-    """Compute nDCG@k for binary relevance labels (1=positive, 0=negative)."""
-    if scores.numel() == 0 or labels01.numel() == 0 or scores.numel() != labels01.numel():
-        return 0.0
-    k_eff = int(max(1, min(int(k), int(scores.numel()))))
-
-    labels01 = labels01.to(torch.float32)
-    top_idx = torch.topk(scores, k=k_eff, dim=0, largest=True, sorted=True).indices
-    rel_top = labels01.index_select(0, top_idx)
-
-    gains = rel_top  # 2^rel - 1 for binary rel equals rel.
-    positions = torch.arange(1, k_eff + 1, device=scores.device, dtype=torch.float32)
-    discounts = torch.log2(positions + 1.0)
-    dcg = float((gains / discounts).sum().item())
-
-    n_pos = int(labels01.sum().item())
-    if n_pos <= 0:
-        return 0.0
-    ideal_hits = min(n_pos, k_eff)
-    ideal_gains = torch.ones(ideal_hits, device=scores.device, dtype=torch.float32)
-    ideal_positions = torch.arange(1, ideal_hits + 1, device=scores.device, dtype=torch.float32)
-    idcg = float((ideal_gains / torch.log2(ideal_positions + 1.0)).sum().item())
-    if idcg <= 1e-12:
-        return 0.0
-    return float(dcg / idcg)
 
 
 def _ndcg_at_k_from_positive_indices(

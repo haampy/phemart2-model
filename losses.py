@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-_BCE = nn.BCEWithLogitsLoss()
 _CE = nn.CrossEntropyLoss()
 
 
@@ -80,6 +79,7 @@ def main_multi_positive_softmax_loss(
     logit_scale: Optional[torch.Tensor] = None,
     sample_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = 0.0,
+    hard_negative_k: int = 0,
 ) -> torch.Tensor:
     """Multi-positive retrieval loss with logits [B, D] over full disease bank."""
     logits = variant_emb @ all_disease_emb.t()
@@ -95,6 +95,18 @@ def main_multi_positive_softmax_loss(
     if valid_rows.numel() == 0:
         return torch.zeros([], device=logits.device, dtype=logits.dtype)
     logits_f = logits.float()
+
+    # Hard negative mining: keep positives + top-k hardest negatives, mask rest to -inf
+    if hard_negative_k > 0 and hard_negative_k < logits_f.shape[1]:
+        pos_mask = torch.zeros(logits_f.shape, dtype=torch.bool, device=logits_f.device)
+        pos_mask[row_idx, col_idx] = True
+        neg_logits = logits_f.clone().detach()
+        neg_logits[pos_mask] = float("-inf")
+        _, topk_neg = neg_logits.topk(hard_negative_k, dim=1)
+        keep = pos_mask.clone()
+        keep.scatter_(1, topk_neg, True)
+        logits_f = logits_f.masked_fill(~keep, float("-inf"))
+
     den = torch.logsumexp(logits_f, dim=1)
     pos_row_max = torch.full(
         (logits.shape[0],),
@@ -256,18 +268,128 @@ def func_multiaxis_loss(
     return losses
 
 
-# 保留旧签名的兼容包装
-def func_impact_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    column_weights: Optional[torch.Tensor] = None,
-    column_scales: Optional[torch.Tensor] = None,
-    loss_type: str = "mse",
-    smooth_l1_beta: float = 1.0,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    return func_regression_loss(pred, target, mask, column_scales, loss_type, smooth_l1_beta, eps)
+
+def sparse_set_infonce_from_log_probs(
+    log_probs: torch.Tensor,
+    teacher_indices: List[torch.Tensor],
+    teacher_probs: List[torch.Tensor],
+    row_weights: Optional[Sequence[torch.Tensor | float]] = None,
+) -> tuple[torch.Tensor, int]:
+    """Multi-Positive InfoNCE over teacher support set.
+
+    Instead of KL(teacher||student) which forces the student to match
+    the (often flat) teacher distribution, this loss only maximises the
+    total softmax mass assigned to the support set S:
+
+        L = -log Σ_{d∈S} Q_student(d)  =  -logsumexp(log_probs[S])
+
+    The model is free to concentrate probability on a few members of S
+    without being penalised for deviating from the flat teacher.
+
+    ``teacher_probs`` is accepted for interface compatibility but is
+    **not used** in the loss computation — only the support set indices
+    from ``teacher_indices`` matter.  This allows swapping with
+    ``sparse_teacher_kl_from_log_probs`` without changing the call site.
+    """
+    if len(teacher_indices) != log_probs.shape[0]:
+        raise ValueError("teacher list length must match log_probs batch dimension")
+    if row_weights is not None and len(row_weights) != log_probs.shape[0]:
+        raise ValueError("row_weights length must match log_probs batch dimension")
+
+    per_row_losses: List[torch.Tensor] = []
+    valid_weights: List[torch.Tensor] = []
+
+    for row_idx, idx in enumerate(teacher_indices):
+        if idx.numel() == 0:
+            continue
+        rw: Optional[torch.Tensor] = None
+        if row_weights is not None:
+            rw = torch.as_tensor(
+                row_weights[row_idx],
+                device=log_probs.device,
+                dtype=log_probs.dtype,
+            ).clamp_min(0.0)
+            if float(rw.item()) <= 0.0:
+                continue
+
+        # -logsumexp(log_probs[row, S])
+        lp_set = log_probs[row_idx].index_select(0, idx)
+        loss_row = -torch.logsumexp(lp_set, dim=0)
+        per_row_losses.append(loss_row)
+        if rw is not None:
+            valid_weights.append(rw)
+
+    if not per_row_losses:
+        return torch.zeros([], device=log_probs.device, dtype=log_probs.dtype), 0
+
+    stacked = torch.stack(per_row_losses)
+    n_valid = len(per_row_losses)
+    if valid_weights:
+        w = torch.stack(valid_weights).to(dtype=stacked.dtype)
+        return (stacked * w).sum() / w.sum().clamp_min(1e-8), n_valid
+    return stacked.mean(), n_valid
+
+
+def sparse_weighted_infonce_from_log_probs(
+    log_probs: torch.Tensor,
+    teacher_indices: List[torch.Tensor],
+    teacher_probs: List[torch.Tensor],
+    row_weights: Optional[Sequence[torch.Tensor | float]] = None,
+) -> tuple[torch.Tensor, int]:
+    """Teacher-weighted Multi-Positive InfoNCE.
+
+    L = -log Σ_{d∈S} w_d · Q(d)  =  -logsumexp(log_probs[S] + log(w[S]))
+
+    Between pure set_infonce and KL:
+    - set_infonce: all S members equal weight → ignores teacher ranking
+    - KL: forces exact distribution match → over-constrains on flat teacher
+    - This: high-prob diseases must get more student mass, but student is
+      free to concentrate on a subset without penalty for deviating.
+
+    Robust to large |S| because low-weight diseases contribute negligibly
+    to logsumexp, so hybrid teacher (|S|≈700) works without truncation.
+    """
+    if len(teacher_indices) != len(teacher_probs):
+        raise ValueError("teacher_indices and teacher_probs must have the same length")
+    if len(teacher_indices) != log_probs.shape[0]:
+        raise ValueError("teacher list length must match log_probs batch dimension")
+    if row_weights is not None and len(row_weights) != log_probs.shape[0]:
+        raise ValueError("row_weights length must match log_probs batch dimension")
+
+    per_row_losses: List[torch.Tensor] = []
+    valid_weights: List[torch.Tensor] = []
+
+    for row_idx, (idx, prob) in enumerate(zip(teacher_indices, teacher_probs)):
+        if idx.numel() == 0 or prob.numel() == 0:
+            continue
+        if idx.numel() != prob.numel():
+            raise ValueError("Each teacher index/prob tensor pair must have same length")
+        rw: Optional[torch.Tensor] = None
+        if row_weights is not None:
+            rw = torch.as_tensor(
+                row_weights[row_idx],
+                device=log_probs.device,
+                dtype=log_probs.dtype,
+            ).clamp_min(0.0)
+            if float(rw.item()) <= 0.0:
+                continue
+
+        lp_set = log_probs[row_idx].index_select(0, idx)
+        log_w = torch.log(prob.to(dtype=log_probs.dtype).clamp_min(1e-12))
+        loss_row = -torch.logsumexp(lp_set + log_w, dim=0)
+        per_row_losses.append(loss_row)
+        if rw is not None:
+            valid_weights.append(rw)
+
+    if not per_row_losses:
+        return torch.zeros([], device=log_probs.device, dtype=log_probs.dtype), 0
+
+    stacked = torch.stack(per_row_losses)
+    n_valid = len(per_row_losses)
+    if valid_weights:
+        w = torch.stack(valid_weights).to(dtype=stacked.dtype)
+        return (stacked * w).sum() / w.sum().clamp_min(1e-8), n_valid
+    return stacked.mean(), n_valid
 
 
 def sparse_teacher_kl_from_log_probs(
@@ -334,6 +456,92 @@ def sparse_teacher_kl_from_log_probs(
         w = torch.stack(weights).to(dtype=stacked.dtype)
         return (stacked * w).sum() / w.sum().clamp_min(1e-8), int(valid_row_t.numel())
     return stacked.mean(), int(valid_row_t.numel())
+
+
+def sparse_slack_constraint_from_log_probs(
+    log_probs: torch.Tensor,
+    teacher_indices: List[torch.Tensor],
+    teacher_probs: List[torch.Tensor],
+    row_weights: Optional[Sequence[torch.Tensor | float]] = None,
+    tau: float = 0.5,
+) -> tuple[torch.Tensor, int]:
+    """Candidate-set regularization via slack constraint.
+
+    Instead of forcing the student to match the teacher distribution (KL)
+    or maximize total mass on the support set (InfoNCE), this loss only
+    penalizes when mass on the support set drops below a threshold τ:
+
+        L = max(0, τ - Σ_{d∈S} p(d|v))²
+
+    This treats the teacher as providing a noisy candidate set (partial
+    multi-label supervision) rather than a ranking signal. The student
+    is free to concentrate on any subset of S, and is not penalized at
+    all once sufficient mass (≥τ) is on the support set.
+
+    ``teacher_probs`` is accepted for interface compatibility but is
+    **not used** — only the support set indices matter.
+    """
+    if len(teacher_indices) != log_probs.shape[0]:
+        raise ValueError("teacher list length must match log_probs batch dimension")
+    if row_weights is not None and len(row_weights) != log_probs.shape[0]:
+        raise ValueError("row_weights length must match log_probs batch dimension")
+
+    per_row_losses: List[torch.Tensor] = []
+    valid_weights: List[torch.Tensor] = []
+
+    for row_idx, idx in enumerate(teacher_indices):
+        if idx.numel() == 0:
+            continue
+        rw: Optional[torch.Tensor] = None
+        if row_weights is not None:
+            rw = torch.as_tensor(
+                row_weights[row_idx],
+                device=log_probs.device,
+                dtype=log_probs.dtype,
+            ).clamp_min(0.0)
+            if float(rw.item()) <= 0.0:
+                continue
+
+        # mass_on_S = sum of softmax probabilities on support set
+        lp_set = log_probs[row_idx].index_select(0, idx)
+        mass_on_s = torch.exp(lp_set).sum()
+
+        # Hinge: only penalize if mass < tau
+        shortfall = torch.clamp(tau - mass_on_s, min=0.0)
+        loss_row = shortfall * shortfall  # squared hinge
+
+        per_row_losses.append(loss_row)
+        if rw is not None:
+            valid_weights.append(rw)
+
+    if not per_row_losses:
+        return torch.zeros([], device=log_probs.device, dtype=log_probs.dtype), 0
+
+    stacked = torch.stack(per_row_losses)
+    n_valid = len(per_row_losses)
+    if valid_weights:
+        w = torch.stack(valid_weights).to(dtype=stacked.dtype)
+        return (stacked * w).sum() / w.sum().clamp_min(1e-8), n_valid
+    return stacked.mean(), n_valid
+
+
+def concept_regression_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Gene-level concept profile 回归 loss (cosine similarity)。
+
+    Args:
+        pred: [B, dim] 模型预测
+        target: [B, dim] SVD target
+        mask: [B] bool, True 表示该 gene 有 concept target
+    """
+    if mask.sum() == 0:
+        return torch.zeros([], device=pred.device)
+    pred_valid = F.normalize(pred[mask], dim=-1)
+    tgt_valid = F.normalize(target[mask], dim=-1)
+    return (1 - (pred_valid * tgt_valid).sum(dim=-1)).mean()
 
 
 def total_loss(

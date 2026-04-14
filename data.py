@@ -3,9 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import hashlib
 import json
+import math
 import random
 import re
 
@@ -47,14 +48,13 @@ FUNC_AXIS_SLICES = {
 FUNC_TARGET_COLS = FUNC_REGRESSION_COLS
 _GENE_TOKEN_SPLIT_RE = re.compile(r"[;|,]")
 _HGVS_GENE_HINT_RE = re.compile(r"\(([^)]+)\)")
+_HGVS_PROTEIN_POS_RE = re.compile(r"\(p\.[a-z]+(\d+)")
+_HGVS_CDNA_POS_RE = re.compile(r":c\.(\d+)")
 
 
 def get_func_mask_cols(target_cols: Sequence[str]) -> List[str]:
     return [f"{c}_mask" for c in target_cols]
 
-
-def get_func_regression_mask_cols() -> List[str]:
-    return list(FUNC_REGRESSION_MASK_COLS)
 
 
 def normalize_id(x: Any) -> str:
@@ -83,6 +83,19 @@ def parse_hgvs_gene_hint(variant_id: Any) -> str:
     if match is None:
         return ""
     return normalize_id(match.group(1))
+
+
+def parse_hgvs_protein_position(variant_id: Any) -> Optional[int]:
+    text = normalize_id(variant_id)
+    if not text:
+        return None
+    m = _HGVS_PROTEIN_POS_RE.search(text)
+    if m:
+        return int(m.group(1))
+    m = _HGVS_CDNA_POS_RE.search(text)
+    if m:
+        return int(m.group(1)) // 3
+    return None
 
 
 def resolve_gene_id(
@@ -283,6 +296,27 @@ def load_func_labels(
             print(f"func_warn: {n_nan} rows have NaN in mask=1 targets, dropping")
             df = df.dropna(subset=selected_targets)
     return df
+
+
+def load_gene_concept_targets(
+    svd_path: str,
+    metadata_path: str,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """加载 gene-level concept SVD embeddings。
+
+    Returns:
+        embeddings: float32 array [n_genes, dim]
+        gene_to_row: gene name (大写) -> row index 映射
+    """
+    embeddings = np.load(svd_path).astype(np.float32)
+    with open(metadata_path, "r") as f:
+        meta = json.load(f)
+    gene_to_row: Dict[str, int] = {
+        str(k).upper(): int(v) for k, v in meta["gene_to_row"].items()
+    }
+    print(f"gene_concept_targets: {embeddings.shape[0]} genes, dim={embeddings.shape[1]}, "
+          f"gene_to_row entries={len(gene_to_row)}")
+    return embeddings, gene_to_row
 
 
 def _load_embeddings_npy(
@@ -650,48 +684,6 @@ def _quantile_bin(values: pd.Series, n_bins: int) -> pd.Series:
     out = pd.Series(np.asarray(binned), index=values.index).fillna(0).astype(int)
     return out
 
-
-def _build_main_gene_strata(
-    main_df: pd.DataFrame,
-    n_bins: int = 3,
-) -> Dict[str, List[str]]:
-    required_cols = {"gene_id", "disease_index", "variant_id"}
-    if not required_cols.issubset(set(main_df.columns)):
-        return {}
-    work = main_df[["gene_id", "disease_index", "variant_id"]].copy()
-    work["gene_id"] = work["gene_id"].map(normalize_id)
-    work = work[work["gene_id"] != ""]
-    if work.empty:
-        return {}
-
-    disease_freq = (
-        work.groupby("disease_index")["variant_id"]
-        .nunique()
-        .astype(float)
-    )
-    pair = work[["gene_id", "disease_index"]].drop_duplicates().copy()
-    pair["_disease_freq"] = pair["disease_index"].map(disease_freq).fillna(0.0)
-
-    gene_stats = pair.groupby("gene_id", as_index=False).agg(
-        disease_degree=("disease_index", "nunique"),
-        mean_disease_freq=("_disease_freq", "mean"),
-    )
-    if gene_stats.empty:
-        return {}
-
-    freq_bin = _quantile_bin(gene_stats["mean_disease_freq"], n_bins=n_bins)
-    degree_bin = _quantile_bin(gene_stats["disease_degree"].astype(float), n_bins=n_bins)
-    gene_stats["_bucket"] = (
-        "f" + freq_bin.astype(str) + "_d" + degree_bin.astype(str)
-    )
-
-    buckets: Dict[str, List[str]] = {}
-    for row in gene_stats[["gene_id", "_bucket"]].itertuples(index=False):
-        gene_id, bucket = row
-        buckets.setdefault(str(bucket), []).append(str(gene_id))
-    for bucket in list(buckets.keys()):
-        buckets[bucket] = sorted(set(buckets[bucket]))
-    return buckets
 
 
 SPLIT_NAMES = ("train", "val", "test")
@@ -2033,19 +2025,6 @@ def build_disease_to_traits_map(
     return out
 
 
-def build_variant_positive_map(
-    main_df: pd.DataFrame,
-    variant_mapping: Dict[str, int],
-) -> Dict[int, Set[int]]:
-    out: Dict[int, Set[int]] = {}
-    for row in main_df[["variant_id", "disease_index"]].itertuples(index=False):
-        variant_id, disease_id = row
-        idx = variant_mapping.get(variant_id)
-        if idx is None:
-            continue
-        out.setdefault(idx, set()).add(int(disease_id))
-    return out
-
 
 @dataclass
 class FeatureStore:
@@ -2063,6 +2042,7 @@ class VariantDiseaseKLTeacher:
     pool_gene_idx: np.ndarray
     variant_idx_to_pool: Dict[int, int]
     variant_mapped_mass: Dict[int, float]
+    variant_kl_weight: Dict[int, float]  # 1.0 for direct-mapped, alpha for gene-propagated
     stats: Dict[str, float]
 
 
@@ -2129,6 +2109,9 @@ def _load_concept_to_disease_from_csv(
     disease_concept_map_csv: str,
     disease_to_col: Dict[int, int],
     direct_weight: float,
+    concept_hpo_structural: Optional[Dict[int, int]] = None,
+    disease_hpo_count: Optional[Dict[int, int]] = None,
+    bridge_length_penalty_b: float = 0.0,
 ) -> Tuple[Dict[int, Dict[int, float]], Dict[str, float]]:
     concept_df = pd.read_csv(disease_concept_map_csv)
     required_cols = {"disease_index", "concept_idx"}
@@ -2141,12 +2124,22 @@ def _load_concept_to_disease_from_csv(
 
     out: Dict[int, Dict[int, float]] = {}
     n_rows_used = 0
+    n_bridge_penalized = 0
     for row in concept_df[["disease_index", "concept_idx", "score"]].itertuples(index=False):
         disease_index, concept_idx, score = row
         d_col = disease_to_col.get(int(disease_index))
         if d_col is None:
             continue
         w = float(score) * float(direct_weight)
+        if bridge_length_penalty_b > 0 and concept_hpo_structural is not None and disease_hpo_count is not None:
+            c_hpo_count = concept_hpo_structural.get(int(concept_idx))
+            if c_hpo_count is not None:
+                d_hpo_count = disease_hpo_count.get(int(disease_index), 1)
+                min_set = min(c_hpo_count, d_hpo_count)
+                avg_set_size = 10.0
+                length_penalty = (1.0 - bridge_length_penalty_b) + bridge_length_penalty_b * (min_set / avg_set_size)
+                w *= length_penalty
+                n_bridge_penalized += 1
         if w <= 0 or not np.isfinite(w):
             continue
         _add_concept_disease_edge(out, int(concept_idx), int(d_col), w)
@@ -2155,6 +2148,7 @@ def _load_concept_to_disease_from_csv(
     stats = {
         "csv_rows_used": float(n_rows_used),
         "csv_mapped_concepts": float(len(out)),
+        "csv_bridge_penalized": float(n_bridge_penalized),
     }
     return out, stats
 
@@ -2167,6 +2161,7 @@ def _load_concept_to_disease_from_hpo_semantic(
     min_similarity: float,
     semantic_weight: float,
     n_concepts: int,
+    hpo_min_terms_for_full_weight: int = 0,
 ) -> Tuple[Dict[int, Dict[int, float]], Dict[str, float]]:
     out: Dict[int, Dict[int, float]] = {}
     if not hpo_semantic_map_json:
@@ -2194,11 +2189,19 @@ def _load_concept_to_disease_from_hpo_semantic(
     min_similarity = float(min_similarity)
     semantic_weight = float(semantic_weight)
     n_edges = 0
+    n_hpo_discounted = 0
     mapped_diseases: Set[int] = set()
     for disease_idx, hpo_terms in disease_hpo_map.items():
         d_col = disease_to_col.get(int(disease_idx))
         if d_col is None:
             continue
+        n_hpo = len(hpo_terms)
+        if hpo_min_terms_for_full_weight > 0:
+            hpo_discount = min(1.0, n_hpo / float(hpo_min_terms_for_full_weight))
+            if hpo_discount < 1.0:
+                n_hpo_discounted += 1
+        else:
+            hpo_discount = 1.0
         any_edge_for_disease = False
         for hpo in hpo_terms:
             hpo_key = str(hpo).strip()
@@ -2229,7 +2232,7 @@ def _load_concept_to_disease_from_hpo_semantic(
                     out,
                     c_idx,
                     int(d_col),
-                    float(semantic_weight) * sim,
+                    float(semantic_weight) * sim * hpo_discount,
                 )
                 n_edges += 1
                 any_edge_for_disease = True
@@ -2241,12 +2244,16 @@ def _load_concept_to_disease_from_hpo_semantic(
         "hpo_mapped_diseases": float(len(mapped_diseases)),
         "hpo_mapped_concepts": float(len(out)),
         "hpo_json_found": 1.0,
+        "hpo_discounted_diseases": float(n_hpo_discounted),
     }
     return out, stats
 
 
 def _merge_concept_to_disease_maps(
     maps: Sequence[Dict[int, Dict[int, float]]],
+    max_diseases_per_concept: int = 0,
+    concept_specificity_weighting: bool = False,
+    concept_quality_scaling: bool = False,
 ) -> Dict[int, List[Tuple[int, float]]]:
     merged_raw: Dict[int, Dict[int, float]] = {}
     for m in maps:
@@ -2255,12 +2262,25 @@ def _merge_concept_to_disease_maps(
                 _add_concept_disease_edge(merged_raw, concept_idx, disease_col, weight)
 
     merged: Dict[int, List[Tuple[int, float]]] = {}
+    max_k = max(int(max_diseases_per_concept), 0)
     for concept_idx, disease_map in merged_raw.items():
+        if max_k > 0 and len(disease_map) > max_k:
+            top_items = sorted(
+                disease_map.items(), key=lambda x: x[1], reverse=True,
+            )[:max_k]
+            disease_map = dict(top_items)
         total = float(sum(disease_map.values()))
         if total <= 0:
             continue
+        n_diseases = len(disease_map)
+        # IDF-like specificity: concepts mapping to fewer diseases get higher weight
+        idf = 1.0 / math.log2(1.0 + n_diseases) if concept_specificity_weighting else 1.0
+        # Quality scaling: multiply by max score so that weak single-disease
+        # concepts (e.g. CUI SapBERT sim=0.80 → sigmoid=0.002) are not
+        # inflated to 1.0 by per-concept normalization.
+        quality = float(max(disease_map.values())) if concept_quality_scaling else 1.0
         pairs = sorted(
-            ((int(d_col), float(w) / total) for d_col, w in disease_map.items()),
+            ((int(d_col), float(w) / total * idf * quality) for d_col, w in disease_map.items()),
             key=lambda x: x[0],
         )
         merged[int(concept_idx)] = pairs
@@ -2355,6 +2375,29 @@ def build_variant_disease_kl_teacher(
     disease_names: Optional[Sequence[str]] = None,
     shuffle_teacher: bool = False,
     shuffle_seed: int = 42,
+    gene_propagation: bool = False,
+    gene_propagation_alpha: float = 0.3,
+    gene_propagation_distance_lambda: float = 0.01,
+    gene_propagation_max_distance: int = 0,
+    gene_propagation_adaptive_alpha: bool = False,
+    gene_propagation_exclude_d2v: bool = True,
+    gene_propagation_entropy_threshold: float = 0.0,
+    gene_propagation_position_unknown_penalty: float = 0.3,
+    gene_propagation_confidence_scaling: bool = False,
+    max_diseases_per_concept: int = 0,
+    concept_specificity_weighting: bool = False,
+    bridge_length_penalty_b: float = 0.0,
+    hpo_min_terms_for_full_weight: int = 0,
+    teacher_max_concepts: int = 0,
+    teacher_concept_temperature: float = 1.0,
+    disease_score_concentration: float = 0.0,
+    quality_row_weight: bool = False,
+    prior_correction_alpha: float = 0.0,
+    train_disease_freq: Optional[Dict[int, int]] = None,
+    raw_corr_mode: bool = False,
+    min_concept_corr: float = 0.01,
+    disease_score_power: float = 1.0,
+    concept_quality_scaling: bool = False,
 ) -> VariantDiseaseKLTeacher:
     """Build sparse teacher distributions for variant<->disease KL.
 
@@ -2365,6 +2408,14 @@ def build_variant_disease_kl_teacher(
     teacher_mode = str(teacher_mode).strip().lower()
     if teacher_mode not in {"concept_map", "hpo_semantic", "hybrid"}:
         raise ValueError(f"Unknown vd_kl teacher_mode: {teacher_mode}")
+
+    # --- Raw correlation mode overrides ---
+    _min_corr = float(min_concept_corr) if raw_corr_mode else 0.0
+    if raw_corr_mode:
+        teacher_mode = "concept_map"  # skip HPO semantic bridge
+        teacher_concept_temperature = 1.0  # no sharpening needed
+        quality_row_weight = True  # auto-enable confidence weighting
+        print(f"raw_corr_mode=True: teacher_mode→concept_map, min_concept_corr={_min_corr}, quality_row_weight→True")
 
     # --- Concept filtering (L0/L1/L2) ---
     excluded_concepts: Set[int] = set()
@@ -2414,11 +2465,28 @@ def build_variant_disease_kl_teacher(
         "shuffle_teacher": float(shuffle_teacher),
     }
 
+    concept_hpo_structural: Optional[Dict[int, int]] = None
+    disease_hpo_count_map: Optional[Dict[int, int]] = None
+    if bridge_length_penalty_b > 0:
+        structural_json_path = Path(disease_concept_map_csv).resolve().parent / "concept_to_hpo_structural.json"
+        if structural_json_path.exists():
+            with open(structural_json_path, "r") as _f:
+                _structural_data = json.load(_f)
+            concept_hpo_structural = {
+                int(k): len(v.get("hpo_terms", [])) for k, v in _structural_data.items()
+            }
+            print(f"bridge_length_penalty: loaded {len(concept_hpo_structural)} structural concepts from {structural_json_path}")
+        if disease_hpo_map:
+            disease_hpo_count_map = {int(k): len(v) for k, v in disease_hpo_map.items()}
+
     if teacher_mode in {"concept_map", "hybrid"}:
         concept_map_csv, csv_stats = _load_concept_to_disease_from_csv(
             disease_concept_map_csv=disease_concept_map_csv,
             disease_to_col=disease_to_col,
             direct_weight=float(concept_direct_weight),
+            concept_hpo_structural=concept_hpo_structural,
+            disease_hpo_count=disease_hpo_count_map,
+            bridge_length_penalty_b=float(bridge_length_penalty_b),
         )
         concept_maps.append(concept_map_csv)
         map_stats.update(csv_stats)
@@ -2436,6 +2504,7 @@ def build_variant_disease_kl_teacher(
             min_similarity=float(hpo_min_similarity),
             semantic_weight=float(concept_semantic_weight),
             n_concepts=n_concepts,
+            hpo_min_terms_for_full_weight=int(hpo_min_terms_for_full_weight),
         )
         concept_maps.append(semantic_map)
         map_stats.update(semantic_stats)
@@ -2445,7 +2514,12 @@ def build_variant_disease_kl_teacher(
         map_stats["hpo_mapped_concepts"] = 0.0
         map_stats["hpo_json_found"] = 0.0
 
-    concept_to_disease = _merge_concept_to_disease_maps(concept_maps)
+    concept_to_disease = _merge_concept_to_disease_maps(
+        concept_maps,
+        max_diseases_per_concept=int(max_diseases_per_concept),
+        concept_specificity_weighting=bool(concept_specificity_weighting),
+        concept_quality_scaling=bool(concept_quality_scaling),
+    )
 
     hgvs_to_rsid: Dict[str, str] = {}
     for rsid_raw, hgvs_raw in rsid_to_hgvs.items():
@@ -2466,6 +2540,10 @@ def build_variant_disease_kl_teacher(
     variant_mapped_mass: Dict[int, float] = {}
     mapped_mass_values: List[float] = []
     max_d = max(int(max_diseases_per_variant), 0)
+    _conc = max(float(disease_score_concentration), 0.0)
+    _conc_filtered_count = 0
+    _max_c = max(int(teacher_max_concepts), 0)
+    _c_temp = float(teacher_concept_temperature)
     for variant_idx, gene_idx in variant_gene.items():
         _ = gene_idx  # keeps intent explicit; gene_idx is used later via variant_gene map.
         hgvs = normalize_id(idx_to_variant.get(variant_idx, ""))
@@ -2482,22 +2560,69 @@ def build_variant_disease_kl_teacher(
         concept_prob = val_mm[row_idx].astype(np.float32, copy=False)
         disease_scores: Dict[int, float] = {}
         mapped_mass = 0.0
+
+        mapped_concepts: List[Tuple[float, int, list]] = []
         for c_idx, p_c in zip(concept_idx, concept_prob):
-            if p_c <= 0:
+            if p_c <= _min_corr:  # raw_corr_mode: use threshold; legacy: 0.0 (= p_c > 0)
                 continue
             if int(c_idx) in excluded_concepts:
                 continue
             mapped = concept_to_disease.get(int(c_idx))
             if not mapped:
                 continue
-            mapped_mass += float(p_c)
-            for disease_col, w_cd in mapped:
-                disease_scores[disease_col] = disease_scores.get(disease_col, 0.0) + float(p_c) * float(w_cd)
+            mapped_concepts.append((float(p_c), int(c_idx), mapped))
+
+        if _max_c > 0 and len(mapped_concepts) > _max_c:
+            mapped_concepts.sort(reverse=True)
+            mapped_concepts = mapped_concepts[:_max_c]
+
+        if mapped_concepts:
+            raw_probs = np.array([mc[0] for mc in mapped_concepts], dtype=np.float64)
+            mapped_mass = float(raw_probs.sum())
+            if raw_corr_mode:
+                # Raw correlation mode: use correlation values directly as weights.
+                # No temperature sharpening, no concept-level renormalization.
+                for p_c_val, c_idx_mc, mapped_mc in mapped_concepts:
+                    for disease_col, w_cd in mapped_mc:
+                        disease_scores[disease_col] = disease_scores.get(disease_col, 0.0) + float(p_c_val) * float(w_cd)
+            else:
+                probs = raw_probs.copy()
+                if _c_temp > 0 and _c_temp != 1.0:
+                    probs = np.power(probs, 1.0 / _c_temp)
+                prob_sum = probs.sum()
+                if prob_sum > 0:
+                    probs = probs / prob_sum
+                for (_, c_idx_mc, mapped_mc), p_renorm in zip(mapped_concepts, probs):
+                    for disease_col, w_cd in mapped_mc:
+                        disease_scores[disease_col] = disease_scores.get(disease_col, 0.0) + p_renorm * float(w_cd)
 
         if not disease_scores:
             continue
         if float(mapped_mass) < float(min_variant_mapped_mass):
             continue
+        # Concentration filter: remove diseases with score below C × uniform baseline.
+        # When teacher distribution is flat, this shrinks S to only the "above-average" entries.
+        if _conc > 0 and len(disease_scores) > 1:
+            n_d = len(disease_scores)
+            total_raw = sum(disease_scores.values())
+            threshold = _conc * (total_raw / n_d)
+            before_n = n_d
+            disease_scores = {d: s for d, s in disease_scores.items() if s >= threshold}
+            if len(disease_scores) < before_n:
+                _conc_filtered_count += 1
+            if not disease_scores:
+                continue
+        # Prior correction: boost rare diseases by dividing by (freq+μ)^α.
+        # This counteracts frequency bias in teacher — rare diseases get
+        # proportionally higher scores, making support set selection fairer.
+        # Uses Laplace smoothing (μ=5) to avoid division by near-zero.
+        if prior_correction_alpha > 0 and train_disease_freq:
+            _mu = 5.0  # Laplace smoothing constant
+            corrected: Dict[int, float] = {}
+            for d, s in disease_scores.items():
+                freq = train_disease_freq.get(d, 0)
+                corrected[d] = s / max((freq + _mu) ** prior_correction_alpha, 1e-8)
+            disease_scores = corrected
         if max_d > 0 and len(disease_scores) > max_d:
             top_items = sorted(
                 disease_scores.items(),
@@ -2513,6 +2638,9 @@ def build_variant_disease_kl_teacher(
         order = np.argsort(disease_cols)
         disease_cols = disease_cols[order]
         disease_vals_raw = disease_vals_raw[order]
+        # Power transform: sharpen disease score distribution before normalization
+        if disease_score_power > 1.0:
+            disease_vals_raw = np.power(disease_vals_raw, disease_score_power)
         total = float(disease_vals_raw.sum())
         if total <= 0:
             continue
@@ -2522,13 +2650,294 @@ def build_variant_disease_kl_teacher(
         variant_mapped_mass[int(variant_idx)] = float(mapped_mass)
         mapped_mass_values.append(float(mapped_mass))
 
+    # --- Row weights: uniform (default) or quality-aware (mapped_mass) ---
+    if quality_row_weight:
+        variant_kl_weight: Dict[int, float] = {
+            v: float(variant_mapped_mass.get(v, 1.0))
+            for v in variant_to_disease
+        }
+    else:
+        variant_kl_weight: Dict[int, float] = {v: 1.0 for v in variant_to_disease}
+    propagated_count = 0
+    filtered_by_entropy = 0
+    pos_known_count = 0
+    pos_unknown_count = 0
+    alpha_values: List[float] = []
+    distance_lambda = float(gene_propagation_distance_lambda)
+    propagated_variant_set: Set[int] = set()
+    if gene_propagation and gene_propagation_alpha > 0:
+        # Step 0: Identify genes that have unmapped training variants (need propagation)
+        needed_genes: Set[str] = set()
+        for v_idx in variant_gene:
+            if v_idx in variant_to_disease:
+                continue
+            hgvs_v = normalize_id(idx_to_variant.get(v_idx, ""))
+            if hgvs_v:
+                g = parse_hgvs_gene_hint(hgvs_v)
+                if g:
+                    needed_genes.add(g)
+
+        # Step 1: Build disease scores for MVP variants in needed genes only
+        #   Fully vectorized with numpy + scipy sparse matmul
+        from scipy.sparse import csr_matrix as _csr
+
+        rsid_to_hgvs_n: Dict[str, str] = {}
+        for rsid_raw, hgvs_raw in rsid_to_hgvs.items():
+            r_n = normalize_id(rsid_raw)
+            h_n = normalize_id(hgvs_raw)
+            if r_n and h_n:
+                rsid_to_hgvs_n[r_n] = h_n
+
+        # 1a) Identify eligible MVP rows and their gene/position
+        _eligible_rows: List[int] = []
+        _eligible_genes: List[str] = []
+        _eligible_pos: List[Optional[int]] = []
+        mvp_skipped_gene = 0
+        for row_idx_mvp in range(len(topk_row_rsids)):
+            rsid_mvp = topk_row_rsids[row_idx_mvp]
+            hgvs_mvp = rsid_to_hgvs_n.get(rsid_mvp)
+            if not hgvs_mvp:
+                continue
+            gene_name_mvp = parse_hgvs_gene_hint(hgvs_mvp)
+            if not gene_name_mvp:
+                continue
+            if gene_name_mvp not in needed_genes:
+                mvp_skipped_gene += 1
+                continue
+            _eligible_rows.append(row_idx_mvp)
+            _eligible_genes.append(gene_name_mvp)
+            _eligible_pos.append(parse_hgvs_protein_position(hgvs_mvp))
+
+        # 1b) Build concept→disease sparse matrix (once)
+        n_diseases = len(disease_ids)
+        _c2d_rows_l: List[int] = []
+        _c2d_cols_l: List[int] = []
+        _c2d_vals_l: List[float] = []
+        max_concept = 0
+        for c_idx_int, mappings_list in concept_to_disease.items():
+            if c_idx_int in excluded_concepts:
+                continue
+            for d_col, w_cd in mappings_list:
+                _c2d_rows_l.append(int(c_idx_int))
+                _c2d_cols_l.append(int(d_col))
+                _c2d_vals_l.append(float(w_cd))
+                if int(c_idx_int) > max_concept:
+                    max_concept = int(c_idx_int)
+        n_concepts = max_concept + 1
+        c2d_sparse = _csr(
+            (np.array(_c2d_vals_l, dtype=np.float32),
+             (np.array(_c2d_rows_l, dtype=np.int64), np.array(_c2d_cols_l, dtype=np.int64))),
+            shape=(n_concepts, n_diseases),
+        )
+
+        # 1c) Build variant→concept sparse matrix (fully vectorized, no Python loop)
+        n_eligible = len(_eligible_rows)
+        eligible_arr = np.array(_eligible_rows, dtype=np.int64)
+        sel_idx = idx_mm[eligible_arr]  # [n_eligible, top_k]
+        sel_val = val_mm[eligible_arr].astype(np.float32)  # [n_eligible, top_k]
+        top_k = sel_idx.shape[1]
+
+        flat_rows = np.repeat(np.arange(n_eligible, dtype=np.int64), top_k)
+        flat_cols = sel_idx.ravel().astype(np.int64)
+        flat_vals = sel_val.ravel()
+
+        # Mask: positive values, within concept bounds, not excluded
+        vmask = flat_vals > 0
+        vmask &= flat_cols < n_concepts
+        vmask &= flat_cols >= 0
+        if excluded_concepts:
+            excl_arr = np.array(sorted(excluded_concepts), dtype=np.int64)
+            vmask &= ~np.isin(flat_cols, excl_arr)
+
+        flat_rows = flat_rows[vmask]
+        flat_cols = flat_cols[vmask]
+        flat_vals = flat_vals[vmask]
+
+        v2c_sparse = _csr(
+            (flat_vals, (flat_rows, flat_cols)),
+            shape=(n_eligible, n_concepts),
+        )
+        # mapped mass = sum of valid concept probs per variant
+        _mass_vec = np.asarray(v2c_sparse.sum(axis=1)).ravel().astype(np.float32)
+        # variant→disease score matrix via sparse matmul
+        v2d_mat = (v2c_sparse @ c2d_sparse).tocsr()  # [n_eligible, n_diseases]
+
+        # 1d) Group MVP entries by gene (lightweight: only indices, not dense matrices)
+        _gene_mvp_entries: Dict[str, List[Tuple[Optional[int], int, float]]] = {}
+        mvp_total_used = 0
+        min_mass_f = float(min_variant_mapped_mass)
+        v2d_indptr = v2d_mat.indptr
+        for local_i in range(n_eligible):
+            m_mass = float(_mass_vec[local_i])
+            if m_mass < min_mass_f:
+                continue
+            start, end = v2d_indptr[local_i], v2d_indptr[local_i + 1]
+            if start == end:
+                continue
+            gene_name_mvp = _eligible_genes[local_i]
+            mvp_pos = _eligible_pos[local_i]
+            _gene_mvp_entries.setdefault(gene_name_mvp, []).append(
+                (mvp_pos, local_i, m_mass)
+            )
+            mvp_total_used += 1
+
+        # Group training variants by gene (for co-processing with MVP data)
+        _gene_train_variants: Dict[str, List[Tuple[int, Optional[int]]]] = {}
+        for v_idx, g_idx in variant_gene.items():
+            if v_idx in variant_to_disease:
+                continue
+            hgvs_t = normalize_id(idx_to_variant.get(v_idx, ""))
+            if not hgvs_t:
+                continue
+            gene_name_t = parse_hgvs_gene_hint(hgvs_t)
+            if not gene_name_t or gene_name_t not in _gene_mvp_entries:
+                continue
+            target_pos = parse_hgvs_protein_position(hgvs_t)
+            _gene_train_variants.setdefault(gene_name_t, []).append((v_idx, target_pos))
+
+        # Step 2: Per-gene processing — build dense matrix, propagate, release
+        #   Peak memory: one gene's matrix (~42 × 1563 × 4B ≈ 256KB) instead of all (~580MB)
+        max_prop_dist = int(gene_propagation_max_distance)
+        pos_unknown_penalty = float(gene_propagation_position_unknown_penalty)
+        entropy_thresh = float(gene_propagation_entropy_threshold)
+        use_confidence_scaling = bool(gene_propagation_confidence_scaling)
+
+        for gene_name, mvp_entries in _gene_mvp_entries.items():
+            train_variants = _gene_train_variants.get(gene_name)
+            if not train_variants:
+                continue
+
+            # Build dense matrix for this gene only
+            n_ent = len(mvp_entries)
+            gene_positions = np.empty(n_ent, dtype=np.float64)
+            gene_masses = np.empty(n_ent, dtype=np.float64)
+            gene_dmat = np.zeros((n_ent, n_diseases), dtype=np.float32)
+            for j, (pos, local_i, mass) in enumerate(mvp_entries):
+                gene_positions[j] = pos if pos is not None else np.nan
+                gene_masses[j] = mass
+                s, e = v2d_mat.indptr[local_i], v2d_mat.indptr[local_i + 1]
+                if s < e:
+                    cols = v2d_mat.indices[s:e]
+                    vals = v2d_mat.data[s:e]
+                    pm = vals > 0
+                    gene_dmat[j, cols[pm]] = vals[pm]
+
+            # Process all training variants in this gene
+            for v_idx, target_pos in train_variants:
+                n_src = n_ent
+
+                # Compute distance-based weights (vectorized)
+                if target_pos is not None:
+                    known_mask = ~np.isnan(gene_positions)
+                    dists = np.abs(gene_positions - target_pos)
+                    weights = np.where(
+                        known_mask,
+                        np.exp(-distance_lambda * np.nan_to_num(dists, nan=0.0)) * gene_masses if distance_lambda > 0 else gene_masses,
+                        gene_masses * pos_unknown_penalty,
+                    )
+                    if max_prop_dist > 0:
+                        too_far = known_mask & (dists > max_prop_dist)
+                        weights[too_far] = 0.0
+                    pos_known_count += int(known_mask.sum())
+                    pos_unknown_count += int((~known_mask).sum())
+                    valid_dists = dists[known_mask]
+                    min_dist = float(valid_dists.min()) if len(valid_dists) > 0 else float("inf")
+                else:
+                    weights = gene_masses * pos_unknown_penalty
+                    pos_unknown_count += n_src
+                    min_dist = float("inf")
+
+                w_sum = float(weights.sum())
+                n_sources_used = int((weights > 0).sum())
+                if w_sum <= 0:
+                    continue
+
+                # Weighted sum: weights[n] @ gene_dmat[n, n_diseases] → agg_vec[n_diseases]
+                agg_vec = weights @ gene_dmat
+
+                # Extract nonzero entries from dense aggregation vector
+                nz_mask = agg_vec > 0
+                if not nz_mask.any():
+                    continue
+                d_cols_p = np.where(nz_mask)[0].astype(np.int64)
+                d_vals_p = agg_vec[nz_mask].astype(np.float32)
+                if max_d > 0 and len(d_cols_p) > max_d:
+                    topk_idx = np.argpartition(d_vals_p, -max_d)[-max_d:]
+                    d_cols_p = d_cols_p[topk_idx]
+                    d_vals_p = d_vals_p[topk_idx]
+                total_agg = float(d_vals_p.sum())
+                if total_agg <= 0:
+                    continue
+                d_vals_normed = d_vals_p / total_agg
+
+                # entropy filter
+                if entropy_thresh > 0 and len(d_vals_normed) > 1:
+                    ent = -float(np.sum(d_vals_normed * np.log(np.clip(d_vals_normed, 1e-12, None))))
+                    max_ent = math.log(len(d_vals_normed))
+                    if max_ent > 0 and ent / max_ent > entropy_thresh:
+                        filtered_by_entropy += 1
+                        continue
+
+                order = np.argsort(d_cols_p)
+                d_cols_p = d_cols_p[order]
+                d_vals_normed = d_vals_normed[order]
+                d_vals_raw_p = d_vals_p[order]
+
+                # alpha: optionally decay with distance to nearest source
+                if gene_propagation_adaptive_alpha and min_dist < float("inf") and distance_lambda > 0:
+                    effective_alpha = gene_propagation_alpha * math.exp(-distance_lambda * min_dist)
+                else:
+                    effective_alpha = float(gene_propagation_alpha)
+
+                # confidence scaling
+                if use_confidence_scaling and n_sources_used > 0:
+                    confidence = 1.0 - math.exp(-0.5 * n_sources_used)
+                    effective_alpha *= confidence
+
+                alpha_values.append(effective_alpha)
+                variant_to_disease[v_idx] = (d_cols_p, d_vals_normed)
+                variant_to_disease_raw[v_idx] = (d_cols_p, d_vals_raw_p)
+                variant_mapped_mass[v_idx] = effective_alpha
+                mapped_mass_values.append(effective_alpha)
+                variant_kl_weight[v_idx] = effective_alpha
+                propagated_variant_set.add(v_idx)
+                propagated_count += 1
+            # gene_dmat is released here (end of gene loop iteration)
+
+        mvp_genes_used = len(_gene_mvp_entries)
+        avg_mvp_per_gene = mvp_total_used / max(mvp_genes_used, 1)
+        del _gene_mvp_entries, _gene_train_variants, v2d_mat, v2c_sparse, _mass_vec
+        avg_alpha = float(np.mean(alpha_values)) if alpha_values else 0.0
+        total_pos_pairs = pos_known_count + pos_unknown_count
+        pos_parse_rate = pos_known_count / max(total_pos_pairs, 1)
+        print(
+            f"gene_propagation_v3: needed_genes={len(needed_genes)} "
+            f"mvp_variants={mvp_total_used} mvp_skipped_gene={mvp_skipped_gene} "
+            f"mvp_genes={mvp_genes_used} "
+            f"avg_mvp_per_gene={avg_mvp_per_gene:.1f} "
+            f"direct={len(variant_kl_weight) - propagated_count} "
+            f"propagated={propagated_count} filtered_by_entropy={filtered_by_entropy} "
+            f"total={len(variant_to_disease)} "
+            f"alpha={gene_propagation_alpha} avg_effective_alpha={avg_alpha:.4f} "
+            f"distance_lambda={distance_lambda} "
+            f"max_distance={max_prop_dist} adaptive_alpha={gene_propagation_adaptive_alpha} "
+            f"confidence_scaling={use_confidence_scaling} "
+            f"entropy_threshold={entropy_thresh} "
+            f"pos_parse_rate={pos_parse_rate:.2%} pos_unknown_penalty={pos_unknown_penalty} "
+            f"exclude_d2v={gene_propagation_exclude_d2v}"
+        )
+
     pool_variant_idx = np.asarray(sorted(variant_to_disease.keys()), dtype=np.int64)
     pool_gene_idx = np.asarray([variant_gene[v] for v in pool_variant_idx], dtype=np.int64)
     variant_idx_to_pool = {int(v): int(i) for i, v in enumerate(pool_variant_idx.tolist())}
 
     disease_bucket: Dict[int, List[Tuple[int, float]]] = {}
+    _prop_set = propagated_variant_set if gene_propagation else set()
+    _exclude_prop = bool(gene_propagation_exclude_d2v) and len(_prop_set) > 0
     # Build d2v from the same sparse joint scores before v2d row-normalization.
     for variant_idx, (disease_cols, disease_scores_raw) in variant_to_disease_raw.items():
+        if _exclude_prop and int(variant_idx) in _prop_set:
+            continue
         pool_pos = variant_idx_to_pool[int(variant_idx)]
         for d_col, score_vd in zip(disease_cols.tolist(), disease_scores_raw.tolist()):
             disease_bucket.setdefault(int(d_col), []).append((pool_pos, float(score_vd)))
@@ -2556,6 +2965,10 @@ def build_variant_disease_kl_teacher(
     mapped_variant_count = len(variant_to_disease)
     train_variant_count = len(variant_gene)
     mapped_mass_arr = np.asarray(mapped_mass_values, dtype=np.float32) if mapped_mass_values else np.asarray([], dtype=np.float32)
+    v2d_support_sizes = np.asarray(
+        [len(d_cols) for d_cols, _ in variant_to_disease.values()],
+        dtype=np.float32,
+    ) if variant_to_disease else np.asarray([], dtype=np.float32)
     stats = {
         "train_variants": float(train_variant_count),
         "mapped_variants": float(mapped_variant_count),
@@ -2570,6 +2983,22 @@ def build_variant_disease_kl_teacher(
         "mapped_mass_mean": float(mapped_mass_arr.mean()) if mapped_mass_arr.size > 0 else 0.0,
         "mapped_mass_median": float(np.median(mapped_mass_arr)) if mapped_mass_arr.size > 0 else 0.0,
         "mapped_mass_p90": float(np.quantile(mapped_mass_arr, 0.9)) if mapped_mass_arr.size > 0 else 0.0,
+        "gene_propagation": float(gene_propagation),
+        "gene_propagation_alpha": float(gene_propagation_alpha) if gene_propagation else 0.0,
+        "gene_propagation_avg_effective_alpha": float(np.mean(alpha_values)) if gene_propagation and alpha_values else 0.0,
+        "gene_propagation_filtered_by_entropy": float(filtered_by_entropy) if gene_propagation else 0.0,
+        "gene_propagation_pos_parse_rate": float(pos_known_count / max(pos_known_count + pos_unknown_count, 1)) if gene_propagation else 0.0,
+        "propagated_variants": float(propagated_count),
+        "direct_mapped_variants": float(len(variant_to_disease) - propagated_count),
+        "v2d_support_size_mean": float(v2d_support_sizes.mean()) if v2d_support_sizes.size > 0 else 0.0,
+        "v2d_support_size_median": float(np.median(v2d_support_sizes)) if v2d_support_sizes.size > 0 else 0.0,
+        "v2d_support_size_max": float(v2d_support_sizes.max()) if v2d_support_sizes.size > 0 else 0.0,
+        "v2d_support_size_p90": float(np.quantile(v2d_support_sizes, 0.9)) if v2d_support_sizes.size > 0 else 0.0,
+        "disease_score_concentration": float(_conc),
+        "concentration_filtered_variants": float(_conc_filtered_count),
+        "raw_corr_mode": float(raw_corr_mode),
+        "min_concept_corr": float(_min_corr),
+        "disease_score_power": float(disease_score_power),
     }
     stats.update(map_stats)
     return VariantDiseaseKLTeacher(
@@ -2579,6 +3008,7 @@ def build_variant_disease_kl_teacher(
         pool_gene_idx=pool_gene_idx,
         variant_idx_to_pool=variant_idx_to_pool,
         variant_mapped_mass=variant_mapped_mass,
+        variant_kl_weight=variant_kl_weight,
         stats=stats,
     )
 

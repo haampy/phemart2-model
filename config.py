@@ -31,6 +31,8 @@ class PathsConfig:
     mvp_hpo_semantic_map: str = "../data/mvp_mappings/hpo_to_mvp_semantic.json"
     domain_variant_x: str = "../data/domain_data/processed/domain_variant_embeddings.csv"
     func_labels: str = "../data/func_impact_data/processed/func_impact_labels_v2.csv"
+    gene_concept_svd: str = "../data/MVP_data/processed/gene_concept_svd64.npy"
+    gene_concept_svd_metadata: str = "../data/MVP_data/processed/gene_concept_svd64_metadata.json"
     split_artifact_path: str = "artifacts/splits/default_split.json"
     output_dir: str = "experiments/minimal_multitask"
 
@@ -108,7 +110,6 @@ class TrainConfig:
     aux_update_hgt: bool = False
     aux_domain_interval: int = 2
     aux_func_interval: int = 1
-    use_inductive_graph_train: bool = False
     func_regression_loss_type: str = "smooth_l1"  # {"smooth_l1", "mse"}
     func_regression_smooth_l1_beta: float = 1.0
     func_mechanism_pos_weight: float = 3.0
@@ -124,9 +125,8 @@ class TrainConfig:
     scheduler_t0: int = 20  # CosineAnnealingWarmRestarts T_0
     scheduler_t_mult: int = 2  # CosineAnnealingWarmRestarts T_mult
     scheduler_eta_min: float = 1e-6  # CosineAnnealingWarmRestarts eta_min
-    report_min_effect_mrr: float = 0.01
-    report_min_effect_r10_rel: float = 0.03
     enable_vd_kl: bool = False
+    vd_kl_loss_type: str = "kl"  # {"kl", "set_infonce", "weighted_set_infonce"}
     vd_kl_teacher_mode: str = "hybrid"  # {"concept_map", "hpo_semantic", "hybrid"}
     vd_kl_lambda_v2d: float = 0.6
     vd_kl_lambda_d2v: float = 0.1
@@ -141,9 +141,16 @@ class TrainConfig:
     vd_kl_hpo_topk_per_hpo: int = 5
     vd_kl_hpo_min_similarity: float = 0.35
     vd_kl_concept_direct_weight: float = 1.0
-    vd_kl_concept_semantic_weight: float = 0.35
+    vd_kl_concept_semantic_weight: float = 0.20
     vd_kl_min_variant_mapped_mass: float = 0.05
     vd_kl_max_diseases_per_variant: int = 32
+    vd_kl_disease_score_concentration: float = 0.0  # keep disease only if score > C × (total/n_diseases); 0=disabled; 2.0=recommended for set_infonce with concept_map.
+    vd_kl_max_diseases_per_concept: int = 0  # 0=unlimited; >0 limits fan-out per concept before normalization
+    vd_kl_concept_specificity_weighting: bool = False  # IDF-like: down-weight concepts mapping to many diseases
+    vd_kl_bridge_length_penalty_b: float = 0.0
+    vd_kl_hpo_min_terms_for_full_weight: int = 0
+    vd_kl_teacher_max_concepts: int = 0  # 0=use all mapped concepts; >0=only top-K by MVP probability
+    vd_kl_teacher_concept_temperature: float = 1.0  # <1.0 sharpens concept probs before aggregation; 1.0=no change
     vd_kl_max_variants_per_disease: int = 256
     vd_kl_positive_smoothing: float = 0.10
     vd_kl_d2v_positive_smoothing: float = 0.20
@@ -155,6 +162,27 @@ class TrainConfig:
     vd_kl_d2v_max_positive_variants: int = 8
     vd_kl_adaptive_weight: bool = False  # MUST be False; adaptive scaling causes runaway KL (see CLAUDE.md)
     vd_kl_adaptive_reference_scale: float = 15.0  # reference logit_scale at which KL lambda equals its nominal value; above this, lambda scales up linearly
+    vd_kl_gene_propagation: bool = False  # propagate teacher signal to same-gene variants without direct teacher
+    vd_kl_gene_propagation_alpha: float = 0.3  # KL weight decay for propagated variants (0-1)
+    vd_kl_gene_propagation_distance_lambda: float = 0.05  # distance decay for position-weighted propagation; 0 = uniform
+    vd_kl_gene_propagation_max_distance: int = 0  # max aa distance for propagation sources; 0 = unlimited
+    vd_kl_gene_propagation_adaptive_alpha: bool = False  # alpha decays with distance to nearest source
+    vd_kl_gene_propagation_exclude_d2v: bool = True  # exclude propagated variants from D2V reverse teacher
+    vd_kl_gene_propagation_entropy_threshold: float = 0.95  # filter propagated variants with normalized entropy > threshold; 0 = disabled
+    vd_kl_gene_propagation_position_unknown_penalty: float = 0.3  # weight multiplier when protein position cannot be parsed
+    vd_kl_gene_propagation_confidence_scaling: bool = False  # scale alpha by source-count confidence: 1-exp(-0.5*n)
+    vd_kl_quality_row_weight: bool = False  # use mapped_mass as row weight for direct-mapped variants (instead of uniform 1.0)
+    vd_kl_prior_correction_alpha: float = 0.0  # prior-correct disease scores: q'_d ∝ q_d / π(d)^α; 0=disabled; >0 boosts rare diseases
+    vd_kl_slack_tau: float = 0.5  # target mass-on-support for slack_constraint loss; only used when loss_type=slack_constraint
+    vd_kl_concept_filter_level: int = 0  # teacher concept filter: 0=none, 1=remove PheCodes+exact disease names, 2=L1+fuzzy 70%
+    vd_kl_shuffle_teacher: bool = False  # shuffle teacher concept indices (negative control)
+    vd_kl_raw_corr_mode: bool = False  # raw correlation pipeline: skip concept temp/renorm, use |corr| threshold, auto quality_row_weight
+    vd_kl_min_concept_corr: float = 0.008  # minimum correlation to include a concept (only in raw_corr_mode); 0.008 ≈ 6σ with 600K samples, significant after Bonferroni
+    vd_kl_disease_score_power: float = 1.0  # power transform on disease_scores before normalization; >1 sharpens (e.g. 2.0)
+    vd_kl_concept_quality_scaling: bool = False  # multiply per-concept normalized weights by max(original_scores); prevents single-disease concepts from being inflated to w_cd=1.0 regardless of original score
+    main_hard_negative_k: int = 0  # 0 = disabled; >0 = keep only top-k hardest negatives per sample in main softmax loss
+    enable_concept_regression: bool = False  # gene-level concept profile regression
+    concept_svd_dim: int = 64  # SVD 降维维度
 
 
 @dataclass
@@ -162,6 +190,7 @@ class LossWeights:
     main: float = 1.0
     domain: float = 0.2
     func: float = 0.05
+    concept: float = 0.1
 
 
 @dataclass
