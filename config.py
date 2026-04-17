@@ -27,7 +27,7 @@ class PathsConfig:
     mvp_topk_indices: str = "../data/MVP_data/processed/mvp_topk_indices_EUR_k256.npy"
     mvp_topk_values: str = "../data/MVP_data/processed/mvp_topk_values_EUR_k256_float16.npy"
     mvp_topk_metadata: str = "../data/MVP_data/processed/mvp_topk_metadata_EUR_k256.json"
-    mvp_disease_concept_map: str = "../data/mvp_mappings/disease_to_concepts.csv"
+    mvp_disease_concept_map: str = "../data/mvp_mappings/disease_to_concepts_v1_cui_sigmoid.csv"
     mvp_hpo_semantic_map: str = "../data/mvp_mappings/hpo_to_mvp_semantic.json"
     domain_variant_x: str = "../data/domain_data/processed/domain_variant_embeddings.csv"
     func_labels: str = "../data/func_impact_data/processed/func_impact_labels_v2.csv"
@@ -142,7 +142,7 @@ class TrainConfig:
     vd_kl_hpo_min_similarity: float = 0.35
     vd_kl_concept_direct_weight: float = 1.0
     vd_kl_concept_semantic_weight: float = 0.20
-    vd_kl_min_variant_mapped_mass: float = 0.05
+    vd_kl_min_variant_mapped_mass: float = 0.03  # lowered from 0.05 to pair with min_concept_corr=0.005 filtering
     vd_kl_max_diseases_per_variant: int = 32
     vd_kl_disease_score_concentration: float = 0.0  # keep disease only if score > C × (total/n_diseases); 0=disabled; 2.0=recommended for set_infonce with concept_map.
     vd_kl_max_diseases_per_concept: int = 0  # 0=unlimited; >0 limits fan-out per concept before normalization
@@ -177,9 +177,9 @@ class TrainConfig:
     vd_kl_concept_filter_level: int = 0  # teacher concept filter: 0=none, 1=remove PheCodes+exact disease names, 2=L1+fuzzy 70%
     vd_kl_shuffle_teacher: bool = False  # shuffle teacher concept indices (negative control)
     vd_kl_raw_corr_mode: bool = False  # raw correlation pipeline: skip concept temp/renorm, use |corr| threshold, auto quality_row_weight
-    vd_kl_min_concept_corr: float = 0.008  # minimum correlation to include a concept (only in raw_corr_mode); 0.008 ≈ 6σ with 600K samples, significant after Bonferroni
+    vd_kl_min_concept_corr: float = 0.005  # minimum correlation to include a concept (only in raw_corr_mode); 0.005 ≈ 4σ with 600K samples
     vd_kl_disease_score_power: float = 1.0  # power transform on disease_scores before normalization; >1 sharpens (e.g. 2.0)
-    vd_kl_concept_quality_scaling: bool = False  # multiply per-concept normalized weights by max(original_scores); prevents single-disease concepts from being inflated to w_cd=1.0 regardless of original score
+    vd_kl_concept_quality_scaling: bool = True  # multiply per-concept normalized weights by max(original_scores); prevents single-disease concepts from being inflated to w_cd=1.0 regardless of original score
     main_hard_negative_k: int = 0  # 0 = disabled; >0 = keep only top-k hardest negatives per sample in main softmax loss
     enable_concept_regression: bool = False  # gene-level concept profile regression
     concept_svd_dim: int = 64  # SVD 降维维度

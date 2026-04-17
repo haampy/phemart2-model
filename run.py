@@ -333,8 +333,8 @@ def _build_task_feature_coverages(
     cfg,
     enabled_tasks: Set[str],
 ) -> Tuple[Dict[str, Dict[str, Set[str]]], Dict[str, Dict[str, int]]]:
-    base_variant_paths = [cfg.paths.variant_x, cfg.paths.legacy_variant_x]
-    base_protein_paths = [cfg.paths.protein_x, cfg.paths.legacy_protein_x]
+    base_variant_paths = [p for p in [cfg.paths.variant_x, cfg.paths.legacy_variant_x] if os.path.exists(p)]
+    base_protein_paths = [p for p in [cfg.paths.protein_x, cfg.paths.legacy_protein_x] if os.path.exists(p)]
     task_paths = {
         "main": (list(base_variant_paths), list(base_protein_paths)),
         "domain": (list(base_variant_paths), list(base_protein_paths)),
@@ -1257,13 +1257,14 @@ def main() -> None:
     protein_x_df = _normalize_index(load_embeddings(cfg.paths.protein_x, required_ids=required_variants))
     n_main_vx, n_main_px = len(variant_x_df), len(protein_x_df)
 
-    # Supplement with task-specific embeddings for variants not in main files
-    supplementary_variant_sources = [
-        ("legacy", cfg.paths.legacy_variant_x),
-    ]
-    supplementary_protein_sources = [
-        ("legacy", cfg.paths.legacy_protein_x),
-    ]
+    # Supplement with task-specific embeddings for variants not in main files.
+    # Legacy paths are optional: if absent (e.g. 合作者只有 main_task_variants 子集), skip them.
+    supplementary_variant_sources: List[Tuple[str, str]] = []
+    supplementary_protein_sources: List[Tuple[str, str]] = []
+    if os.path.exists(cfg.paths.legacy_variant_x):
+        supplementary_variant_sources.append(("legacy", cfg.paths.legacy_variant_x))
+    if os.path.exists(cfg.paths.legacy_protein_x):
+        supplementary_protein_sources.append(("legacy", cfg.paths.legacy_protein_x))
     if "func" in enabled_tasks:
         supplementary_variant_sources.append(("mvp", cfg.paths.mvp_hgvs_embeddings))
         supplementary_protein_sources.append(("mvp", cfg.paths.mvp_protein_x))
